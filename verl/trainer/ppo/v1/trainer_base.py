@@ -464,7 +464,17 @@ class PPOTrainer(ABC):
 
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
         """Run a single local update: sample one mini-batch and perform the full PPO pipeline once."""
+
+        def _log_gpu_mem(stage: str):
+            import torch
+            for i in range(torch.cuda.device_count()):
+                alloc = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                print(f"[GPU MEM] {stage}: GPU{i} alloc={alloc:.2f}GB reserved={reserved:.2f}GB total={total:.2f}GB", flush=True)
+
         # 1. sample batch from replay buffer
+        _log_gpu_mem("before_gen")
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
             batch, off_policy_metrics = self.replay_buffer.sample(
@@ -477,40 +487,49 @@ class PPOTrainer(ABC):
             self.on_sample_end()
 
         # 2. [OPTIONAL] compute reward score with colocated reward model
+        _log_gpu_mem("before_reward")
         if self.reward_loop_manager.reward_loop_worker_handles is None:
             with marked_timer("reward", timing_raw, color="yellow"):
                 batch = self._compute_reward_colocate(batch, metrics=metrics)
 
         # 3. balance batch across data parallel groups
+        _log_gpu_mem("before_balance")
         batch = self._balance_batch(batch, metrics=metrics)
 
         # 4. compute old_log_prob
+        _log_gpu_mem("before_old_log_prob")
         with marked_timer("old_log_prob", timing_raw, color="blue"):
             batch = self._compute_old_log_prob(batch, metrics=metrics)
 
         # 5. [OPTIONAL] compute ref_log_prob
+        _log_gpu_mem("before_ref")
         if self.use_reference_policy:
             with marked_timer("ref", timing_raw, color="olive"):
                 batch = self._compute_ref_log_prob(batch, metrics=metrics)
 
         # 6. [OPTIONAL] compute critic values
+        _log_gpu_mem("before_values")
         if self.use_critic:
             with marked_timer("values", timing_raw, color="cyan"):
                 batch = self._compute_values(batch, metrics=metrics)
 
         # 7. compute advantage and return
+        _log_gpu_mem("before_adv")
         with marked_timer("adv", timing_raw, color="brown"):
             batch = self._compute_advantage(batch, metrics=metrics)
 
         # 8. [OPTIONAL] update critic
+        _log_gpu_mem("before_update_critic")
         if self.use_critic:
             with marked_timer("update_critic", timing_raw, color="pink"):
                 batch = self._update_critic(batch, metrics=metrics)
 
         # 9. update actor
+        _log_gpu_mem("before_update_actor")
         if self.config.trainer.critic_warmup <= self.global_steps:
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch = self._update_actor(batch, metrics=metrics)
+        _log_gpu_mem("after_update_actor")
 
         return batch
 
@@ -1636,7 +1655,21 @@ class PPOTrainer(ABC):
         }
         batch.extra_info.update(extra_info)
 
+        # Log GPU memory before update_actor
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                print(f"[GPU MEM] Before update_actor: GPU{i} alloc={allocated:.2f}GB reserved={reserved:.2f}GB total={total:.2f}GB", flush=True)
+
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                print(f"[GPU MEM] After update_actor: GPU{i} alloc={allocated:.2f}GB reserved={reserved:.2f}GB", flush=True)
         output = rename_dict(output["metrics"], "actor/")
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         actor_metrics = reduce_metrics(output)

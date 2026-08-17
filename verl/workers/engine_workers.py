@@ -344,11 +344,23 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
 
+        # GPU memory logging for OOM debugging
+        import torch
+        def _gpu_mem(tag):
+            for i in range(torch.cuda.device_count()):
+                alloc = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                print(f"[GPU MEM] {tag}: GPU{i} alloc={alloc:.2f}GB reserved={reserved:.2f}GB", flush=True)
+
+        _gpu_mem("before_train_batch")
+
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
         ):
+            _gpu_mem("in_train_mode")
             output = self.engine.train_batch(data, loss_function=self.loss_fn)
+            _gpu_mem("after_engine_train_batch")
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last

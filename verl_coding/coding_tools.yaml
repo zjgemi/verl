@@ -1,0 +1,50 @@
+tools:
+  - class_name: verl_coding.coding_sandbox_tool.SandboxTool
+    config:
+      type: native
+      images_path: /trisol/input/datasets/ds-0/images.json
+    tool_schema:
+      type: function
+      function:
+        name: execute_command
+        description: >
+          Execute a shell command inside the sandbox environment. Use this to write Python code
+          to files, run scripts, install packages, inspect files, or execute any shell command
+          needed to solve the coding problem. The sandbox has all required scientific computing
+          packages pre-installed.
+        parameters:
+          type: object
+          properties:
+            command:
+              type: string
+              description: "The shell command to execute in the sandbox."
+            timeout:
+              type: integer
+              description: "Optional timeout in seconds (default: 600)."
+          required:
+            - command
+        strict: false
+
+  - class_name: verl_coding.coding_sandbox_tool.WebSearchTool
+    config:
+      type: native
+      bohrium_api_key: ""
+    tool_schema:
+      type: function
+      function:
+        name: web_search
+        description: >
+          Search the open web for documentation, tutorials, API references, or any
+          information needed to solve the coding problem.
+        parameters:
+          type: object
+          properties:
+            query:
+              type: string
+              description: "The search query string."
+            num:
+              type: integer
+              description: "Number of results to return (1-10, default: 5)."
+          required:
+            - query
+        strict: false

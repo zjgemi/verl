@@ -121,7 +121,7 @@ class HermesToolParser(ToolParser):
                 name, arguments = function_call["name"], function_call["arguments"]
                 function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
             except Exception as e:
-                logger.error(f"Failed to decode tool call: {e}")
+                logger.error(f"Failed to decode tool call: {e}, raw_text: {match[:500]}")
 
         # remaing text exclude tool call tokens
         content = self.tool_call_regex.sub("", text)
@@ -178,7 +178,7 @@ class GptOssToolParser(ToolParser):
                 # don't check if arguments is valid JSON and leave it to client
                 function_calls.append(FunctionCall(name=name, arguments=arguments))
             except Exception as e:
-                logger.error(f"Failed to decode tool call: {e}")
+                logger.error(f"Failed to decode tool call: {e}, raw_text: {match[:500]}")
 
         # remaing text exclude tool call tokens
         content = regex.sub(self.tool_call_pattern, "", text)

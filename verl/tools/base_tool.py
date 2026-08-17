@@ -30,7 +30,8 @@ class BaseTool:
     - `create`: create a tool instance for a trajectory.
     - `execute`: execute the tool.
     - `calc_reward`: calculate the reward respect to tool state.
-    - `release`: release the tool instance.
+    - `release`: release the tool instance (per tool call).
+    - `cleanup`: cleanup the tool instance at the end of a trajectory.
     """
 
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
@@ -86,6 +87,17 @@ class BaseTool:
 
     async def release(self, instance_id: str, **kwargs) -> None:
         """Release the tool instance.
+
+        Args:
+            instance_id: The instance id of the tool.
+        """
+        pass
+
+    async def cleanup(self, instance_id: str, **kwargs) -> None:
+        """Cleanup the tool instance at the end of a trajectory.
+
+        Unlike release() which is called after each tool execution,
+        cleanup() is called once when the trajectory is complete.
 
         Args:
             instance_id: The instance id of the tool.
