@@ -30,6 +30,7 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.experimental.agent_loop.utils import build_gpt_oss_tool_response_text
+from verl.tools.base_tool import BaseTool
 from verl.tools.function_tool import FunctionTool, normalize_function_tool_return
 from verl.tools.schemas import OpenAIFunctionCallSchema, OpenAIFunctionParsedSchema, ToolResponse
 from verl.utils.profiler import simple_timer
@@ -162,16 +163,26 @@ class ToolAgentLoop(AgentLoopBase):
 
         # State machine loop
         state = AgentState.PENDING
-        while state != AgentState.TERMINATED:
-            if state == AgentState.PENDING:
-                state = await self._handle_pending_state(agent_data, sampling_params)
-            elif state == AgentState.GENERATING:
-                state = await self._handle_generating_state(agent_data, sampling_params)
-            elif state == AgentState.PROCESSING_TOOLS:
-                state = await self._handle_processing_tools_state(agent_data)
-            else:
-                logger.error(f"Invalid state: {state}")
-                state = AgentState.TERMINATED
+        try:
+            while state != AgentState.TERMINATED:
+                if state == AgentState.PENDING:
+                    state = await self._handle_pending_state(agent_data, sampling_params)
+                elif state == AgentState.GENERATING:
+                    state = await self._handle_generating_state(agent_data, sampling_params)
+                elif state == AgentState.PROCESSING_TOOLS:
+                    state = await self._handle_processing_tools_state(agent_data)
+                else:
+                    logger.error(f"Invalid state: {state}")
+                    state = AgentState.TERMINATED
+        finally:
+            # BaseTool instances are per-trajectory (keyed by request_id): clean them up
+            # once the trajectory ends so per-trajectory resources (e.g. sandboxes) are freed.
+            for tool in getattr(agent_data, "_active_tools", self.tools).values():
+                if isinstance(tool, BaseTool):
+                    try:
+                        await tool.cleanup(agent_data.request_id)
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up tool '{tool.__class__.__name__}': {e}")
 
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
@@ -515,9 +526,13 @@ class ToolAgentLoop(AgentLoopBase):
                 raw = await tool.call(tool_args)
                 tool_execution_response, tool_reward, res = normalize_function_tool_return(raw)
             else:
-                # BaseTool subclass
+                # BaseTool subclass: instance is per-trajectory (keyed by request_id),
+                # so repeated calls within one trajectory reuse the same instance.
                 kwargs = tools_kwargs.get(tool_name, {})
-                instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
+                instance_id, _ = await tool.create(
+                    instance_id=agent_data.request_id,
+                    create_kwargs=kwargs.get("create_kwargs", {}),
+                )
                 tool_execution_response, tool_reward, res = await tool.execute(
                     instance_id, tool_args, agent_data=agent_data
                 )

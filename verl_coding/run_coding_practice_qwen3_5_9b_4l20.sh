@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 
-# GRPO | Qwen3.5-9B | multi-turn coding RL | 4x L20 FSDP training
+# GRPO | Qwen3.5-9B | multi-turn coding RL | 4x A100/L20 LoRA training
 #
 # Scientific coding practice RL training with tool agent loop.
 # The model learns to solve scientific computing problems by writing Python code
 # and executing it in a Docker sandbox environment.
 #
-# Hardware: 4x NVIDIA L20 (48GB VRAM each, 192GB total)
+# Default config: LoRA rank32/alpha64, Ulysses SP=4, response 32k, n=8, lr=1e-5
+# Stable on 4x A100-80GB (peak ~51GB) and 4x L20-48GB with offload.
 #
 # Usage:
 #   bash verl_coding/run_coding_practice_qwen3_5_9b_4l20.sh
@@ -26,39 +27,51 @@ VAL_FILE=${VAL_FILE:-/trisol/input/datasets/ds-0/validation.parquet}
 # Tool config for multi-turn agent loop
 TOOL_CONFIG_PATH=${TOOL_CONFIG_PATH:-$(python3 -c "import verl_coding, os; print(os.path.join(os.path.dirname(verl_coding.__file__), 'coding_tools.yaml'))")}
 IMAGES_PATH=${IMAGES_PATH:-/trisol/input/datasets/ds-0/images.json}
+MAX_CONCURRENT_SANDBOXES=${MAX_CONCURRENT_SANDBOXES:-16}
 
 # Python path additions (lbg_sandbox_manager, coding tools, etc.)
 EXTRA_PYTHON_DIR=${EXTRA_PYTHON_DIR:-}
 
-# Hardware: 4x NVIDIA L20
+# Hardware
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
 
-# Batch & sequence sizing (scaled for 4 GPUs)
+# LoRA
+LORA_RANK=${LORA_RANK:-32}
+LORA_ALPHA=${LORA_ALPHA:-64}
+
+# Batch & sequence sizing
 train_batch_size=${TRAIN_BATCH_SIZE:-16}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-4}
 max_prompt_length=${MAX_PROMPT_LENGTH:-16384}
-max_response_length=${MAX_RESPONSE_LENGTH:-16384}
-ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
+max_response_length=${MAX_RESPONSE_LENGTH:-32768}
+ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}
+max_model_len=${MAX_MODEL_LEN:-49152}
 
 # Multi-turn
 max_assistant_turns=${MAX_ASSISTANT_TURNS:-10}
 max_tool_response_length=${MAX_TOOL_RESPONSE_LENGTH:-2048}
 
 # Optimization
-actor_lr=${ACTOR_LR:-1e-6}
+actor_lr=${ACTOR_LR:-1e-5}
 kl_loss_coef=${KL_LOSS_COEF:-0.001}
 entropy_coeff=${ENTROPY_COEFF:-0}
 
-# Rollout: TP=2 for 4 GPUs (2 GPUs for inference, 2 for actor sharding)
+# Ulysses sequence parallel (reduces per-GPU activation peak)
+ulysses_sp=${ULYSSES_SP:-4}
+
+# Rollout
 rollout_tp=${ROLLOUT_TP:-2}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.35}
-rollout_n=${ROLLOUT_N:-4}
+rollout_n=${ROLLOUT_N:-8}
+rollout_load_format=${ROLLOUT_LOAD_FORMAT:-safetensors}
+rollout_layered_summon=${ROLLOUT_LAYERED_SUMMON:-True}
 
 # Training
 total_epochs=${TOTAL_EPOCHS:-10}
 save_freq=${SAVE_FREQ:-20}
 test_freq=${TEST_FREQ:-5}
+val_before_train=${VAL_BEFORE_TRAIN:-False}
 
 # Logging
 PROJECT_NAME=${PROJECT_NAME:-verl_coding_practice}
@@ -69,13 +82,18 @@ agent_num_workers=${AGENT_NUM_WORKERS:-8}
 ########################### end user-adjustable ###########################
 
 ########################### derived defaults ###########################
-# GPU settings for L20 (48GB): no offloading needed
 actor_param_offload=True
-actor_optimizer_offload=True
+actor_optimizer_offload=False
 n_trainer_devices=${NGPUS_PER_NODE}
 
 # Ensure PYTHONPATH includes the project root and extra dependencies
 export PYTHONPATH="${PWD}:${EXTRA_PYTHON_DIR}:${PYTHONPATH:-}"
+
+# Generate tool config with current sandbox concurrency limit
+_tool_config_orig="${TOOL_CONFIG_PATH}"
+_tool_config_tmp=$(mktemp /tmp/coding_tools_XXXXXX.yaml)
+sed "s/max_concurrent_sandboxes: [0-9]*/max_concurrent_sandboxes: ${MAX_CONCURRENT_SANDBOXES}/" "${_tool_config_orig}" > "${_tool_config_tmp}"
+TOOL_CONFIG_PATH="${_tool_config_tmp}"
 
 ########################### parameter arrays ###########################
 
@@ -97,7 +115,9 @@ MODEL=(
     actor_rollout_ref.model.path="$MODEL_PATH"
     actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.model.enable_gradient_checkpointing=True
-    +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
+    +actor_rollout_ref.model.override_config.attn_implementation=sdpa
+    ++actor_rollout_ref.model.lora_rank=${LORA_RANK}
+    ++actor_rollout_ref.model.lora_alpha=${LORA_ALPHA}
 )
 
 ACTOR=(
@@ -112,6 +132,7 @@ ACTOR=(
     actor_rollout_ref.actor.fsdp_config.param_offload=${actor_param_offload}
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_optimizer_offload}
     ++actor_rollout_ref.actor.fsdp_config.model_dtype=bf16
+    ++actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=${ulysses_sp}
 )
 
 ROLLOUT=(
@@ -119,8 +140,10 @@ ROLLOUT=(
     actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp}
     actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_mem_util}
     actor_rollout_ref.rollout.n=${rollout_n}
-    ++actor_rollout_ref.rollout.max_model_len=32768
+    ++actor_rollout_ref.rollout.max_model_len=${max_model_len}
     ++actor_rollout_ref.rollout.max_num_seqs=128
+    ++actor_rollout_ref.rollout.load_format=${rollout_load_format}
+    ++actor_rollout_ref.rollout.layered_summon=${rollout_layered_summon}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
     # Multi-turn tool agent configuration
@@ -139,6 +162,7 @@ REF=(
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
     actor_rollout_ref.ref.fsdp_config.param_offload=True
     ++actor_rollout_ref.ref.fsdp_config.model_dtype=bf16
+    ++actor_rollout_ref.ref.fsdp_config.ulysses_sequence_parallel_size=${ulysses_sp}
 )
 
 TRAINER=(
@@ -152,6 +176,7 @@ TRAINER=(
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}
     trainer.default_local_dir=/trisol/output/checkpoints
+    ++trainer.val_before_train=${val_before_train}
 )
 
 ########################### launch ###########################

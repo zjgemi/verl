@@ -29,9 +29,11 @@ import json
 import logging
 import os
 import time
+import asyncio
 from typing import Any, Optional
 from uuid import uuid4
 
+import ray
 import requests
 
 from verl.tools.base_tool import BaseTool
@@ -39,6 +41,44 @@ from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+# ---------------------------------------------------------------------------
+# Global sandbox concurrency quota (shared across all agent loop workers)
+# ---------------------------------------------------------------------------
+_SANDBOX_QUOTA_ACTOR_NAME = "verl_coding_sandbox_quota"
+
+
+@ray.remote
+class _SandboxQuota:
+    """Cluster-wide semaphore limiting how many sandboxes exist at once.
+
+    Permits are keyed by trajectory instance_id (idempotent acquire) and carry
+    a lease TTL so that permits orphaned by dead trajectories eventually expire
+    instead of deadlocking the pool.
+    """
+
+    def __init__(self, limit: int, lease_ttl: float = 19800.0):
+        self._limit = limit
+        self._lease_ttl = lease_ttl
+        self._holders: dict[str, float] = {}
+
+    def try_acquire(self, owner: str) -> bool:
+        now = time.time()
+        for key, ts in list(self._holders.items()):
+            if now - ts > self._lease_ttl:
+                del self._holders[key]
+        if owner in self._holders:
+            return True
+        if len(self._holders) < self._limit:
+            self._holders[owner] = now
+            return True
+        return False
+
+    def release(self, owner: str) -> None:
+        self._holders.pop(owner, None)
+
+    def stats(self) -> dict:
+        return {"in_use": len(self._holders), "limit": self._limit}
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -78,13 +118,16 @@ def _find_image_for_domain(domain: str, images: dict[str, str]) -> str | None:
 class SandboxTool(BaseTool):
     """Execute shell commands inside a persistent Docker sandbox.
 
-    Uses LBGSandboxManager. The sandbox is created once per trajectory and
-    persists across multiple ``execute()`` calls. Since ``ToolAgentLoop._call_tool``
-    always calls ``release()`` after each execution, ``release()`` is a no-op.
-    Actual cleanup is done via ``cleanup()``.
+    Uses LBGSandboxManager. One sandbox is created per trajectory on the first
+    tool call and persists across all ``execute()`` calls of that trajectory:
+    ``create()`` reuses the instance keyed by the trajectory's request_id and
+    ``release()`` (called after each tool execution) is a no-op. Actual cleanup
+    happens in ``cleanup()``, which the agent loop calls once when the
+    trajectory ends.
 
-    The instance_id is tracked via ``agent_data.extra_fields["sandbox_instance_id"]``
-    so ``create()`` can reuse the existing sandbox on subsequent calls.
+    Concurrent sandboxes are capped cluster-wide via a named Ray actor
+    (``max_concurrent_sandboxes`` in the tool config, default 16); sandbox
+    creation blocks until a permit is available.
 
     Required ``create_kwargs``:
         image: The Docker image to use for the sandbox.
@@ -100,6 +143,19 @@ class SandboxTool(BaseTool):
         super().__init__(config, tool_schema)
         self._instances: dict[str, Any] = {}  # instance_id -> {manager, sandbox_id, ...}
         self._images = _load_images(config.get("images_path"))
+        self._max_concurrent = int(config.get("max_concurrent_sandboxes", 16))
+        self._quota = None
+
+    def _get_quota(self):
+        """Lazy-init the cluster-wide sandbox quota actor."""
+        if self._quota is None:
+            try:
+                self._quota = ray.get_actor(_SANDBOX_QUOTA_ACTOR_NAME)
+            except ValueError:
+                self._quota = _SandboxQuota.options(
+                    name=_SANDBOX_QUOTA_ACTOR_NAME, get_if_exists=True
+                ).remote(self._max_concurrent)
+        return self._quota
 
     def _resolve_image(self, create_kwargs: dict) -> str:
         """Resolve the Docker image from create_kwargs."""
@@ -129,7 +185,7 @@ class SandboxTool(BaseTool):
                 sandbox_id = manager.create_sandbox(
                     template_name=template_name,
                     never_timeout=False,
-                    timeout=3600,
+                    timeout=18000,
                 )
                 logger.debug(f"[sandbox] Sandbox ready: {sandbox_id}")
                 return manager, sandbox_id, template_name
@@ -161,6 +217,12 @@ class SandboxTool(BaseTool):
         if not image:
             return instance_id, ToolResponse(text="[error] No Docker image specified for sandbox")
 
+        # Throttle global sandbox concurrency; wait until a permit is available.
+        quota = self._get_quota()
+        while not await quota.try_acquire.remote(instance_id):
+            logger.info(f"[sandbox] concurrency limit ({self._max_concurrent}) reached, waiting: {instance_id}")
+            await asyncio.sleep(5)
+
         try:
             manager, sandbox_id, template_name = self._build_sandbox(image, create_kwargs)
             self._instances[instance_id] = {
@@ -173,6 +235,7 @@ class SandboxTool(BaseTool):
             return instance_id, ToolResponse(text=f"Sandbox created. ID: {sandbox_id}")
 
         except Exception as e:
+            await quota.release.remote(instance_id)
             logger.error(f"[sandbox] Failed to create sandbox: {e}")
             return instance_id, ToolResponse(text=f"[error] Failed to create sandbox: {e}")
 
@@ -238,12 +301,21 @@ class SandboxTool(BaseTool):
             return {"success": False, "stdout": "", "stderr": str(e), "exit_code": -1, "execution_time": round(elapsed, 3)}
 
     async def release(self, instance_id: str, **kwargs) -> None:
-        """Release the sandbox after each tool call."""
-        await self.cleanup(instance_id)
+        """No-op: the sandbox is shared by all tool calls within a trajectory.
+
+        The sandbox is created on the first tool call of a trajectory and kept
+        alive for subsequent calls; cleanup() destroys it when the trajectory
+        ends.
+        """
+        return
 
     async def cleanup(self, instance_id: str) -> None:
-        """Actually destroy the sandbox and release resources."""
+        """Destroy the trajectory's sandbox and release its quota permit."""
         instance = self._instances.pop(instance_id, None)
+        try:
+            await self._get_quota().release.remote(instance_id)
+        except Exception as e:
+            logger.warning(f"[sandbox] Error releasing quota for {instance_id}: {e}")
         if instance is None:
             return
         try:
