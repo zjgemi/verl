@@ -695,6 +695,12 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
                             return await _read_async_response(response)
                     else:
                         async with session.post(url, json=payload or {}, timeout=timeout) as response:
+                            if response.status >= 400:
+                                # Read the body before raising so the server's
+                                # rejection reason (e.g. LoRA load failure detail)
+                                # shows up in the logs instead of a bare status.
+                                body = await response.text()
+                                logger.error(f"HTTP {response.status} for {endpoint}: {body[:2000]}")
                             response.raise_for_status()
                             return await _read_async_response(response)
 
@@ -780,7 +786,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
             {
                 "lora_name": req.lora_name,
                 "config_dict": req.config_dict,
-                "serialized_tensors": req.serialized_tensors,
+                "serialized_named_tensors": req.serialized_named_tensors,
             },
         )
 

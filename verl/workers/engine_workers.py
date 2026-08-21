@@ -723,8 +723,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         set_expandable_segments(False)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
+        # LoRA adapter mode: sleep only released kv_cache (base weights stay on GPU
+        # for adapter-only sync), so resuming "weights" would hit KeyError in the
+        # rollout engine. Decide sleep_level up front; peft_config check below
+        # confirms the same condition via the engine.
+        if not self.peft_merge and self.config.model.get("lora_rank", 0) > 0:
+            self.rollout.sleep_level = 1
+
         # 1. resume rollout memory (weights were released during sleep)
-        if self.config.rollout.free_cache_engine:
+        if self.config.rollout.free_cache_engine and self.rollout.sleep_level != 1:
             await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
 

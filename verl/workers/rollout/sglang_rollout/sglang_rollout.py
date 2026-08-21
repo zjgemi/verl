@@ -15,10 +15,12 @@
 # limitations under the License.
 from __future__ import annotations
 
+import base64
 import logging
 import multiprocessing as mp
 import os
-from dataclasses import asdict
+import pickle
+from dataclasses import asdict, is_dataclass
 from typing import Generator
 
 import ray
@@ -337,7 +339,7 @@ class ServerAdapter(BaseRollout):
                 req = LoadLoRAAdapterFromTensorsReqInput(
                     lora_name=SGLANG_LORA_NAME,
                     config_dict=serialize_peft_config,
-                    serialized_tensors=serialize_named_tensors,
+                    serialized_named_tensors=serialize_named_tensors,
                 )
                 # send http request
                 await self._engine.load_lora_adapter_from_tensor(req)
@@ -434,11 +436,23 @@ class ServerAdapter(BaseRollout):
         await self._engine.update_weights_from_tensor(req)
 
     def wrap_lora_params(self, peft_config: LoraConfig, weights: Generator[tuple[str, torch.Tensor]]):
-        # peft config
-        peft_config_json = asdict(peft_config)
-        peft_config_json["task_type"] = peft_config_json["task_type"].value
-        peft_config_json["peft_type"] = peft_config_json["peft_type"].value
-        peft_config_json["target_modules"] = list(peft_config_json["target_modules"])
+        # peft config — accept dataclass / dict / objects with to_dict, and
+        # normalize enum and set fields so the payload is JSON-serializable.
+        if is_dataclass(peft_config) and not isinstance(peft_config, type):
+            peft_config_json = asdict(peft_config)
+        elif isinstance(peft_config, dict):
+            peft_config_json = dict(peft_config)
+        elif hasattr(peft_config, "to_dict"):
+            peft_config_json = peft_config.to_dict()
+        else:
+            raise TypeError(f"Unsupported peft_config type: {type(peft_config)!r}")
+        task_type = peft_config_json.get("task_type")
+        peft_config_json["task_type"] = task_type.value if hasattr(task_type, "value") else task_type
+        peft_type = peft_config_json.get("peft_type")
+        peft_config_json["peft_type"] = peft_type.value if hasattr(peft_type, "value") else peft_type
+        target_modules = peft_config_json.get("target_modules")
+        if target_modules is not None and not isinstance(target_modules, str):
+            peft_config_json["target_modules"] = list(target_modules)
 
         # lora weights
         processed_weights: dict[str, torch.Tensor] = {
@@ -448,7 +462,12 @@ class ServerAdapter(BaseRollout):
         infer_tp_size = self.device_mesh["infer_tp"].mesh.size()[0]
         serialized_named_tensors = []
         for i in range(infer_tp_size):
-            serialized_tensors = MultiprocessingSerializer.serialize(processed_weights, output_str=True)
+            # Plain pickle (inline storage bytes) instead of sglang's
+            # MultiprocessingSerializer (torch FD-passing reductions): the
+            # sglang scheduler runs in a different process with a different
+            # multiprocessing authkey, so FD-passing deserialization fails
+            # with AuthenticationError. LoRA deltas are small, inline is cheap.
+            serialized_tensors = base64.b64encode(pickle.dumps(processed_weights)).decode("utf-8")
             serialized_named_tensors.append(serialized_tensors)
 
         return peft_config_json, serialized_named_tensors

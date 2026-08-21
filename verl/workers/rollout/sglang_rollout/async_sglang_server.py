@@ -327,7 +327,11 @@ class SGLangHttpServer:
                 {
                     "enable_lora": True,
                     "max_lora_rank": self.model_config.lora_rank,
-                    "lora_target_modules": self.model_config.target_modules,
+                    "lora_target_modules": (
+                        ["all"]
+                        if self.model_config.target_modules in ("all", "all-linear")
+                        else self.model_config.target_modules
+                    ),
                 }
             )
         # Only set dist_init_addr for multi-node; for single-node, let SGLang
@@ -467,7 +471,12 @@ class SGLangHttpServer:
             raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
-            obj = ResumeMemoryOccupationReqInput(tags=["kv_cache", "weights"])
+            # Mirror sleep(): with LoRA as adapter only kv_cache was released.
+            if self.lora_as_adapter:
+                tags = ["kv_cache"]
+            else:
+                tags = ["kv_cache", "weights"]
+            obj = ResumeMemoryOccupationReqInput(tags=tags)
             await self.tokenizer_manager.resume_memory_occupation(obj, None)
             await self.tokenizer_manager.flush_cache()
         elif self.rollout_mode == RolloutMode.STANDALONE:
@@ -593,6 +602,19 @@ class SGLangHttpServer:
             f"max_new_tokens {max_new_tokens} exceeds available context space {max_possible_tokens}"
         )
         sampling_params["max_new_tokens"] = max_new_tokens
+
+        # sglang only stops on hf_config.eos_token_id (config.json). For models
+        # like Qwen3.5 the chat turn end (<|im_end|>) is the *tokenizer's* eos,
+        # which is NOT in config.json's eos_token_id — generation would run past
+        # <|im_end|> and leak it into the output text (breaking tool parsing).
+        # Merge the tokenizer eos into stop_token_ids for every request.
+        tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            stop_token_ids = set(sampling_params.get("stop_token_ids") or [])
+            stop_token_ids.add(eos_token_id)
+            sampling_params["stop_token_ids"] = sorted(stop_token_ids)
+
         return_logprob = sampling_params.pop("logprobs", False)
 
         # vLLM-style "prompt_logprobs=K" from the distillation teacher: request
