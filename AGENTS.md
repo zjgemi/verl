@@ -1309,13 +1309,32 @@ shard0 **恰好 0** 而 shard1 **0.372**；这里 sdpa 那 6.19e-03 两个 shard
 6e-03 —— bf16 的相对分辨率本来就是 2^-8≈3.9e-03）。flash 那边因为 varlen 边界是从
 `position_ids` 重算的，与分片无关，所以两种分包都逐位相同。
 
-⇒ **原生 flash 路可以用。** 跑它时把 `ATTN_IMPL=flash_attention_2` 传进
-`run_coding_practice_qwen3_5_9b_4l20.sh`（该脚本的 `ATTN_IMPL` 已做成 env 可选）。
+⇒ **原生 flash 路可以用**，`run_coding_practice_qwen3_5_9b_4l20.sh` 的 `ATTN_IMPL`
+默认就是 `flash_attention_2`（`40569084`），装不上 flash_attn 的镜像上传 `ATTN_IMPL=sdpa` 逃生。
 
-**镜像：`registry.dp.tech/dptech/dp/native/prod-1760009/11106/verl-coding-spattn-fa:20260911`**
-（base `202608292148` + `patch_qwen3_5_sp_attn.py` + flash_attn 2.8.3 轮子，`lbg image commit` 产出，
-构建 8 分钟）。两个 backend 都在里面，`ATTN_IMPL` 选哪个都行 —— 这是它相对
-`verl-coding-spattn-20260911c`（只有 sdpa 补丁）的唯一区别。
+### 镜像谱系（用哪个）
+
+| tag | base | 内容 |
+|---|---|---|
+| `verl-coding-spattn-20260911c` | `202608292148` | 只有 SP 补丁。**旧，别用** |
+| `verl-coding-spattn-fa:20260911` | 同上 | + flash_attn 2.8.3。**但 run 脚本是 base 那份，硬编码 `attn_implementation=sdpa`，切 backend 必须尾部 `++...` 覆盖** |
+| **`verl-coding-spattn-fa:20260911b`** | 同上 | + 仓库 HEAD 的 run 脚本 ⇒ `ATTN_IMPL` env 真的存在、默认 flash。**用这个** |
+
+（全在 `registry.dp.tech/dptech/dp/native/prod-1760009/11106/` 下。）
+
+**`:20260911b` 里的 `verl_coding` 仍停在 `c03260cb` 之前** —— 那个提交把沙盒
+`timeout=18000` 改成 `sandbox_timeout` 默认 **7200**（寿命 5h→2h），是实质行为改变，
+故意没打进去，免得混进"只修 SP bug"的对照里。要上它得单独打一版。
+
+**换 site-packages 里的文件前先用 md5 gate 住 base 的状态**：
+镜像里那份 run 脚本的 md5 必须等于仓库 `6c19df7b~1` 的 `0dd3bd88...`，
+不等就说明 base 不是你以为的那个 commit，直接 `cp` HEAD 会静默带进/丢掉别的改动。
+
+**CPU 沙盒上不要用 `is_flash_attn_2_available()` 验 flash_attn** ——
+它的门是 `is_available and (is_torch_cuda_available() or is_torch_mlu_available())`，
+无 GPU 时**结构上恒为 False**，看起来像"装坏了"。CPU 侧能验的判据是
+`import flash_attn` + **`import flash_attn_2_cuda`**（后者是编译好的 CUDA 扩展，
+ABI 不匹配会在这里炸）；`is_flash_attn_2_available()` 留到 GPU 沙盒再看。
 
 ## lbg 沙盒/镜像的实测约束（2026-09-10）
 
