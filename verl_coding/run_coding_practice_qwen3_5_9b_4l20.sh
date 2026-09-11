@@ -19,11 +19,12 @@ INFER_BACKEND=${INFER_BACKEND:-vllm}
 
 # Model
 MODEL_PATH=${MODEL_PATH:-/trisol/input/model}
-# `flash_attention_2` needs the flash_attn package in the image; transformers raises
-# instead of falling back when it is missing, hence the sdpa default. Both backends get
-# the Ulysses all-to-all (sdpa via `qwen3_5_attn_forward`, flash via the
-# `_flash_attention_forward` hook), so this is a perf/availability knob, not a correctness one.
-ATTN_IMPL=${ATTN_IMPL:-sdpa}
+# Both backends get the Ulysses all-to-all (flash via the `_flash_attention_forward` hook,
+# sdpa via `qwen3_5_attn_forward`), so this is a perf knob, not a correctness one. flash is
+# the default because it is the path verl maintains upstream; set ATTN_IMPL=sdpa on images
+# that ship without flash_attn -- transformers raises on the missing package rather than
+# falling back, so the wrong default there is a hard failure, not a slow run.
+ATTN_IMPL=${ATTN_IMPL:-flash_attention_2}
 
 # Data
 TRAIN_FILE=${TRAIN_FILE:-/trisol/input/datasets/ds-0/train.parquet}
