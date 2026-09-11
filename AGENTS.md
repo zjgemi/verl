@@ -805,10 +805,16 @@ trisol train logs <job> --team infra-spot --history \
 负值就被吃掉，`pg_loss:-0.00047` 会变成 `0.00047`，符号翻了还看不出来。用正则取：
 
 ```python
-re.search(re.escape(key) + r':(-?[\d.eE+]+)', line).group(1)
+re.search(re.escape(key) + r':(-?\d+\.?\d*(?:[eE][+-]?\d+)?)', line).group(1)
 ```
 
 （`actor/pg_loss`、`distillation/loss` 这些**带符号**的量是判据本身，符号错了结论就反了。）
+
+**⚠️ 之前这里写的是 `r':(-?[\d.eE+]+)'`，它会吃掉科学计数法的负指数**：字符类里有 `e` 和 `+`
+却没有 `-`，`3.52e-05` 被截成 `"3.51999099166278e"`，指数整个丢掉。2026-09-11 读自蒸馏
+`distillation/loss` 时踩到 —— 真值 3.52e-05，截断后看起来像个 3.5 量级的数，
+**判据差了五个数量级还不报错**（`float()` 那一步才会炸，只打印就完全看不出来）。
+用上面的写法：尾数和指数分开匹配，指数的正负号显式允许。
 
 **`trisol train get -o json` 没有顶层 `envs` 字段** —— 提交时的环境变量在 `custom_config` 里，
 要核对某次任务实际带了什么 env（比如确认 treatment 真的生效）得去那里找。
@@ -1522,6 +1528,51 @@ actor/distillation/loss_max:   7.73   (loss_max_clamp=10.0 未触顶)
 `num_turns/mean=52.6`（assistant+tool 交替计数，对应 30 个 assistant 轮上限），
 `response_length/mean=27986`、`max=68807`，`perf/mfu/actor=0.104`。
 
+### ★★★ SP bug 修完后地板塌掉 1900 倍，上面那张表整体作废（2026-09-11）
+
+同配置（自蒸馏、2 节点、教师 TP=2×4 replica、`batch=8 × n=4`）在
+`verl-coding-spattn-fa:20260911` 上重跑两臂，`opd-step1-self-flash-0911` /
+`opd-step1-self-sdpa-0911`：
+
+| | v4（带 SP bug） | **flash** | **sdpa** |
+|---|---|---|---|
+| `actor/distillation/loss`（带符号） | **−6.61e-02** | **+3.52e-05** | **+5.66e-05** |
+| `actor/distillation/abs_loss` | 0.2007 | **0.00602** | **0.00570** |
+| `rollout_corr/kl` | 0.1574 | 3.65e-04 | 3.09e-04 |
+| `rollout_corr/k3_kl` | 0.1461 | 3.32e-04 | 3.21e-04 |
+| `rollout_corr/log_ppl_abs_diff` | 0.1536 | 4.13e-04 | 3.94e-04 |
+| `rollout_actor_probs_pearson_corr` | 0.8239 | **0.99953** | **0.99950** |
+| `actor/grad_norm` | 0.455 | **0.01256** | **0.01280** |
+| `loss_min` / `loss_max` | −22.71 / 7.73 | −1.23 / 0.82 | −1.14 / 1.35 |
+
+**带符号的 loss 绝对值降到 1/1900，`abs_loss` 降到 1/33。** 三条独立佐证说明这不是偶然：
+
+- `grad_norm` 0.455 → 0.0126，**回到 RL 那几次的 0.01–0.05 区间**。上一节写的
+  "0.455 全部由引擎偏差驱动"得到了直接确认 —— bug 修掉，它就没了。
+- `loss_min` 的重尾 −22.7 → −1.2，偏差分布不再重尾。
+- `pearson` 0.9995 与单卡探针（0.9996）、`probe-spattn-fix2-0911`（0.99953）**三处吻合**。
+
+**⇒ 上一节"真教师 `abs_loss` 低于 ~0.2 的部分不可区分"这条判据作废，新地板是
+`abs_loss ≈ 0.006` / 带符号 loss ≈ **3–6e-05**。** 27B 教师那次的 `+0.0402` 是在旧地板下量的，
+相对新地板是 **1100 倍**，所以"27B 有真实信号"这个结论**更强了**而不是被推翻 ——
+但那次的 `abs_loss=0.2571` 里约 0.2 是引擎偏差，**要在修复后的镜像上重跑才能读出纯教学信号的量级**。
+
+**两个 backend 的地板是同一个**（`abs_loss` 0.00602 vs 0.00570，差 5.5%），
+符合「flash_attn 阴性」那节的结论：单卡 kernel 不对齐只有 ~1% 的效应。
+
+**timing 分不出 backend，不要用它选**：
+
+| | flash | sdpa | |
+|---|---|---|---|
+| `timing_s/gen`（**vLLM，不经过任何 attention 补丁**） | 2214.7 | 2363.2 | flash 快 **6.3%** |
+| `timing_s/old_log_prob` | 113.6 | 119.5 | flash 快 4.9% |
+| `timing_s/update_actor` | 207.9 | 180.7 | sdpa 快 13.1% |
+| `timing_s/step` | 2614 | 2740 | flash 快 4.6% |
+
+**`gen` 是噪声标尺** —— 它完全走 vLLM，两臂在这一项上结构相同，实测却差 6.3%。
+`old_log_prob` 的 4.9% 比噪声还小，`update_actor` 的 13% 与噪声同量级且方向相反。
+**单步单次的 timing 差异全部落在噪声里，选 backend 只能按"上游维护哪条路"来定。**
+
 **踩过的两个提交坑（都是我自己的）**：
 - `WANDB_API_KEY` 构造 submit 命令时被截断（86→60 字符），任务在 `trainer.fit()`
   第一行 `Tracking(...)` 崩 `wandb.errors.CommError: returned error 401`。
@@ -1551,3 +1602,8 @@ actor/distillation/loss_max:   7.73   (loss_max_clamp=10.0 未触顶)
 
 **⇒ 以后 OPD 一律看 `actor/distillation/loss`（带符号）+ 它与自蒸馏基线的差，
 不要看 `abs_loss` 的绝对值。** 相关：[[opd-engine-bias-floor]]。
+
+**⚠️ 这一节的两个数都是在带 SP bug 的镜像上量的，基线已经换了**（见上一节）：
+自蒸馏基线从 −0.0661 变成 **+3.5e-05**，所以 27B 的 `+0.0402` 现在是地板的
+**1100 倍**——"27B 有真实信号"这个结论更强了。但 `abs_loss=0.2571` 里约 0.2 是引擎偏差，
+**27B 那步必须在修复后的镜像上重跑**，否则读不出纯教学信号的量级。
