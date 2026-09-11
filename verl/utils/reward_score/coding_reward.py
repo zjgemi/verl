@@ -53,14 +53,19 @@ def string2obj(answer: str) -> Any:
         return answer.strip() if isinstance(answer, str) else answer
 
 
-def value_check(a: Any, b: Any, tol: float = 0.01) -> bool:
-    """Compare two values with nested structure support and numeric tolerance."""
+def value_check(a: Any, b: Any, tol: float = 0.01, atol: float = 1e-6) -> bool:
+    """Compare two values with nested structure support and numeric tolerance.
+
+    ``tol`` is relative, ``atol`` is the absolute floor. Without the floor a ground
+    truth of 0 collapses the relative bound to 0, so any float round-off
+    (e.g. pred 2.2e-16 vs gt 0.0) is scored wrong.
+    """
     if a is None or b is None:
         return False
     if isinstance(a, (int, float, complex)) and isinstance(b, (int, float, complex)):
         if abs(a) + abs(b) == 0:
             return True
-        return abs(a - b) <= max(abs(a), abs(b)) * tol
+        return abs(a - b) <= atol + max(abs(a), abs(b)) * tol
     if isinstance(a, bool) and isinstance(b, bool):
         return a == b
     if isinstance(a, dict) and isinstance(b, dict):
