@@ -1312,6 +1312,11 @@ shard0 **恰好 0** 而 shard1 **0.372**；这里 sdpa 那 6.19e-03 两个 shard
 ⇒ **原生 flash 路可以用。** 跑它时把 `ATTN_IMPL=flash_attention_2` 传进
 `run_coding_practice_qwen3_5_9b_4l20.sh`（该脚本的 `ATTN_IMPL` 已做成 env 可选）。
 
+**镜像：`registry.dp.tech/dptech/dp/native/prod-1760009/11106/verl-coding-spattn-fa:20260911`**
+（base `202608292148` + `patch_qwen3_5_sp_attn.py` + flash_attn 2.8.3 轮子，`lbg image commit` 产出，
+构建 8 分钟）。两个 backend 都在里面，`ATTN_IMPL` 选哪个都行 —— 这是它相对
+`verl-coding-spattn-20260911c`（只有 sdpa 补丁）的唯一区别。
+
 ## lbg 沙盒/镜像的实测约束（2026-09-10）
 
 - `lbg sdbx exec`：**所有 flag 必须在 `sandbox_id` 之前**，用 `--cwd` 指定目录，
