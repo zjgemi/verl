@@ -4,6 +4,7 @@ tools:
       type: native
       images_path: /trisol/input/datasets/ds-0/images.json
       max_concurrent_sandboxes: 16
+      sandbox_timeout: 7200
     tool_schema:
       type: function
       function:

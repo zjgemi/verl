@@ -129,6 +129,11 @@ class SandboxTool(BaseTool):
     (``max_concurrent_sandboxes`` in the tool config, default 16); sandbox
     creation blocks until a permit is available.
 
+    Configurable options (in tool config):
+        max_concurrent_sandboxes: int = 16  (cluster-wide sandbox cap)
+        sandbox_timeout: int = 7200  (sandbox auto-destroy lifetime in seconds;
+                                     effectively a per-trajectory wall-clock cap)
+
     Required ``create_kwargs``:
         image: The Docker image to use for the sandbox.
         domain: The problem domain name. Used to auto-resolve the image from
@@ -141,9 +146,11 @@ class SandboxTool(BaseTool):
 
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
         super().__init__(config, tool_schema)
-        self._instances: dict[str, Any] = {}  # instance_id -> {manager, sandbox_id, ...}
+        self._instances: dict[str, Any] = {}  # instance_id -> {manager, sandbox_id, start_time, ...}
         self._images = _load_images(config.get("images_path"))
         self._max_concurrent = int(config.get("max_concurrent_sandboxes", 16))
+        self._sandbox_timeout = int(config.get("sandbox_timeout", 7200))
+        self._lease_ttl = self._sandbox_timeout + 3600
         self._quota = None
 
     def _get_quota(self):
@@ -154,7 +161,7 @@ class SandboxTool(BaseTool):
             except ValueError:
                 self._quota = _SandboxQuota.options(
                     name=_SANDBOX_QUOTA_ACTOR_NAME, get_if_exists=True
-                ).remote(self._max_concurrent)
+                ).remote(self._max_concurrent, self._lease_ttl)
         return self._quota
 
     def _resolve_image(self, create_kwargs: dict) -> str:
@@ -185,7 +192,7 @@ class SandboxTool(BaseTool):
                 sandbox_id = manager.create_sandbox(
                     template_name=template_name,
                     never_timeout=False,
-                    timeout=18000,
+                    timeout=self._sandbox_timeout,
                 )
                 logger.debug(f"[sandbox] Sandbox ready: {sandbox_id}")
                 return manager, sandbox_id, template_name
@@ -230,6 +237,7 @@ class SandboxTool(BaseTool):
                 "sandbox_id": sandbox_id,
                 "template_name": template_name,
                 "image": image,
+                "start_time": time.time(),
             }
 
             return instance_id, ToolResponse(text=f"Sandbox created. ID: {sandbox_id}")
@@ -315,14 +323,20 @@ class SandboxTool(BaseTool):
         try:
             await self._get_quota().release.remote(instance_id)
         except Exception as e:
-            logger.warning(f"[sandbox] Error releasing quota for {instance_id}: {e}")
+            print(f"[sandbox] Error releasing quota for {instance_id}: {e}")
         if instance is None:
+            print(f"[sandbox] cleanup called but no instance found for {instance_id}")
             return
+        elapsed = time.time() - instance.get("start_time", time.time())
+        print(
+            f"[sandbox] Trajectory ended: id={instance_id} sandbox={instance.get('sandbox_id')} "
+            f"duration={elapsed:.1f}s"
+        )
         try:
             instance["manager"].close_sandbox()
-            logger.debug(f"[sandbox] Cleaned up sandbox: {instance['sandbox_id']}")
+            print(f"[sandbox] Cleaned up sandbox: {instance['sandbox_id']}")
         except Exception as e:
-            logger.warning(f"[sandbox] Error during cleanup: {e}")
+            print(f"[sandbox] Error during cleanup: {e}")
 
 
 # ---------------------------------------------------------------------------
