@@ -1284,10 +1284,33 @@ chunked-prefill 的 GEMM 规约顺序差**（pearson 0.9997 = 已经贴着 bf16 
 **不要再为"对齐引擎"做任何事。**
 
 装 flash_attn 剩下的唯一理由是**性能/少维护一份补丁**（可以不再 `override attn_implementation=sdpa`，
-走 verl 原生 `_flash_attention_forward` 的 a2a）。但注意那条路**并不更保险**：qwen3_5 + SP 从来
-没人真跑过它（flash_attn 一直缺），而且它每层要 all_gather 一次 `position_ids`
-（`monkey_patch.py:87-147`），我们的 sdpa 补丁按全局 `cu_seqlens` 分段**零额外通信**。
-要换只能拿实测 `timing_s/old_log_prob` 说话，不要因为"flash 听起来更快"就换。
+走 verl 原生 `_flash_attention_forward` 的 a2a）。那条路每层要 all_gather 一次 `position_ids`
+（`monkey_patch.py:87-147`），我们的 sdpa 补丁按全局 `cu_seqlens` 分段**零额外通信**，
+所以**换过去不保证更快**，要拿实测 `timing_s/old_log_prob` 说话。
+
+### 原生 flash 的 SP 路径 preflight：通过（2026-09-11，2×L20 真 NCCL）
+
+"qwen3_5 + SP 从来没人真跑过原生 flash a2a"这个风险**已经排掉**。
+`engine_probe/test_sp_attn_gpu.py`（bf16 / 2 层纯 full_attention / world=2 / n_kv=4，
+参照是同模型同 dtype 同 backend 的 SP=1）：
+
+| | 单条 512 | packed 320+192（**段边界与 shard 边界不对齐**） |
+|---|---|---|
+| `sdpa`（我们的补丁） | **0.0** 逐位 | 6.19e-03（两 shard 同量级，bf16 噪声） |
+| `flash_attention_2`（verl 原生 hook） | **0.0** 逐位 | **0.0** 逐位 |
+
+`_flash_attention_forward` 计数 `sp_off=2 sp_on=2`（每层一次）⇒ hook 确实在跑；
+`position_ids` 经 `Qwen3_5Attention.forward` 的 `**kwargs` 一路传到
+`_ulysses_flash_attention_forward`，a2a 的门（`position_ids is not None`）正常触发。
+
+**判据要看的是 shard 之间的不对称，不是"误差非零"。** 修复前的 bug 签名是
+shard0 **恰好 0** 而 shard1 **0.372**；这里 sdpa 那 6.19e-03 两个 shard 齐平
+（我的补丁按段切 causal，与 masked-full 的求和顺序不同，fp32 下是 5.4e-08，bf16 下放大到
+6e-03 —— bf16 的相对分辨率本来就是 2^-8≈3.9e-03）。flash 那边因为 varlen 边界是从
+`position_ids` 重算的，与分片无关，所以两种分包都逐位相同。
+
+⇒ **原生 flash 路可以用。** 跑它时把 `ATTN_IMPL=flash_attention_2` 传进
+`run_coding_practice_qwen3_5_9b_4l20.sh`（该脚本的 `ATTN_IMPL` 已做成 env 可选）。
 
 ## lbg 沙盒/镜像的实测约束（2026-09-10）
 
