@@ -109,12 +109,17 @@ def get_distillation_loss_settings(loss_name: str) -> DistillationLossSettings:
 def compute_distillation_loss_range(
     distillation_losses: torch.Tensor, response_mask: torch.Tensor
 ) -> dict[str, Metric]:
-    """Compute min and max distillation loss over valid response tokens."""
+    """Compute mean, min and max distillation loss over valid response tokens.
+
+    The signed mean is logged alongside ``abs_loss``: for k1 the sign tells whether the
+    student is over- or under-confident relative to the teacher, which ``abs_loss`` hides.
+    """
     if response_mask.is_nested:
         distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
     else:
         distillation_losses_response = distillation_losses[response_mask.bool()]
     return {
+        "distillation/mean_loss": Metric(AggregationType.MEAN, distillation_losses_response.mean()),
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
     }
