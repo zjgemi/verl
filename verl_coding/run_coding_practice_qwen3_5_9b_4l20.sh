@@ -19,6 +19,11 @@ INFER_BACKEND=${INFER_BACKEND:-vllm}
 
 # Model
 MODEL_PATH=${MODEL_PATH:-/trisol/input/model}
+# `flash_attention_2` needs the flash_attn package in the image; transformers raises
+# instead of falling back when it is missing, hence the sdpa default. Both backends get
+# the Ulysses all-to-all (sdpa via `qwen3_5_attn_forward`, flash via the
+# `_flash_attention_forward` hook), so this is a perf/availability knob, not a correctness one.
+ATTN_IMPL=${ATTN_IMPL:-sdpa}
 
 # Data
 TRAIN_FILE=${TRAIN_FILE:-/trisol/input/datasets/ds-0/train.parquet}
@@ -115,7 +120,7 @@ MODEL=(
     actor_rollout_ref.model.path="$MODEL_PATH"
     actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.model.enable_gradient_checkpointing=True
-    +actor_rollout_ref.model.override_config.attn_implementation=sdpa
+    +actor_rollout_ref.model.override_config.attn_implementation=${ATTN_IMPL}
     ++actor_rollout_ref.model.lora_rank=${LORA_RANK}
     ++actor_rollout_ref.model.lora_alpha=${LORA_ALPHA}
 )

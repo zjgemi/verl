@@ -497,6 +497,7 @@ def apply_monkey_patch(
     elif model.config.model_type in ["qwen3_5", "qwen3_5_moe"]:
         # Step 1: patch model to support image-text mixed data
         from transformers.models.qwen3_5.modeling_qwen3_5 import (
+            Qwen3_5Attention,
             Qwen3_5DecoderLayer,
             Qwen3_5ForConditionalGeneration,
             Qwen3_5GatedDeltaNet,
@@ -505,6 +506,7 @@ def apply_monkey_patch(
             Qwen3_5VisionModel,
         )
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeAttention,
             Qwen3_5MoeDecoderLayer,
             Qwen3_5MoeForConditionalGeneration,
             Qwen3_5MoeGatedDeltaNet,
@@ -516,6 +518,7 @@ def apply_monkey_patch(
         from verl.models.transformers.qwen3_5 import (
             fast_pos_embed_interpolate,
             forward_with_normal_backend,
+            qwen3_5_attn_forward,
             qwen3_5_base_forward,
             qwen3_5_decoder_layer_forward,
             qwen3_5_gated_delta_net_forward,
@@ -537,6 +540,14 @@ def apply_monkey_patch(
         if ulysses_sp_size > 1:
             patch_vlm_for_ulysses_input_slicing(Qwen3_5TextModel)
             patch_vlm_for_ulysses_input_slicing(Qwen3_5MoeTextModel)
+
+            # Step 3: full-attention layers need the all-to-all for every backend, not just
+            # flash attention. The generic `_flash_attention_forward` hook below is never
+            # reached under e.g. `attn_implementation=sdpa`, which would silently confine
+            # attention to each rank's own 1/sp slice of the sequence.
+            Qwen3_5Attention.forward = qwen3_5_attn_forward
+            Qwen3_5MoeAttention.forward = qwen3_5_attn_forward
+            print(f"Monkey patch {model.__class__.__name__} attention layer for Ulysses SP")
 
     if use_remove_padding or ulysses_sp_size > 1:
         if hasattr(module, "_flash_attention_forward"):  # transformers <= 4.47.1 or legacy models

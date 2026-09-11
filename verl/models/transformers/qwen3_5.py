@@ -335,6 +335,163 @@ def qwen3_5_gated_delta_net_forward(
     return output
 
 
+def _packed_segment_bounds(cu_seqlens_cpu, cu_seqlens, total_len: int) -> list[int]:
+    """Boundaries of the packed samples inside a gathered (global) sequence of ``total_len``.
+
+    ``cu_seqlens`` is the unsliced offsets tensor the engine passes down, already extended
+    with the sequence-parallel pad when there is one (see ``transformer_impl.py``). Prefer
+    the cpu copy -- reading the cuda one back would sync on every layer.
+    """
+    bounds = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+    if bounds is None:
+        return [0, total_len]
+
+    raw = [int(x) for x in bounds.tolist()]
+    if raw[0] != 0 or raw[-1] > total_len:
+        raise ValueError(f"cu_seqlens {raw[0]}..{raw[-1]} does not describe a sequence of {total_len} tokens")
+
+    bounds = [0]
+    for offset in raw[1:]:
+        if offset > bounds[-1]:  # drop empty samples
+            bounds.append(offset)
+    if bounds[-1] < total_len:
+        bounds.append(total_len)  # trailing sequence-parallel padding
+    return bounds
+
+
+def qwen3_5_attn_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor] = None,
+    past_key_values=None,
+    **kwargs,
+):
+    """Backend-agnostic Ulysses SP for Qwen3.5 full-attention layers.
+
+    The generic hook in ``monkey_patch.py`` only replaces
+    ``transformers.integrations.flash_attention._flash_attention_forward``, so it is dead
+    code whenever ``attn_implementation`` is not flash attention (e.g. ``sdpa``). Without
+    an all-to-all each rank attends only inside its own contiguous 1/sp slice of the
+    sequence -- a silent correctness bug, not a precision one.
+
+    This mirrors ``verl/models/transformers/qwen2.py``: gather the sequence / scatter the
+    heads around whichever attention interface the config selects. RoPE is applied before
+    the all-to-all, on the local shard, because cos/sin are built from the local (but
+    globally-valued) position ids.
+
+    Packing is handled by looping over the *global* ``cu_seqlens`` segments with a causal,
+    mask-free call per segment. HF builds its own block-causal mask from the local shard's
+    position ids, which describes the wrong rows/columns once the sequence is gathered, and
+    the global dense equivalent would be ``total_nnz**2`` (~16 GB at 126k tokens).
+
+    Flash-attention backends are left alone: ``monkey_patch`` also replaces
+    ``_flash_attention_forward``, which already does the all-to-all there.
+    """
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        apply_rotary_pos_emb,
+        eager_attention_forward,
+        repeat_kv,
+    )
+
+    from verl.utils.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
+
+    cu_seqlens = kwargs.pop("cu_seqlens", None)
+    cu_seqlens_cpu = kwargs.pop("cu_seqlens_cpu", None)
+
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+    gate = gate.reshape(*input_shape, -1)
+
+    query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+    attn_impl = self.config._attn_implementation
+    ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
+    # flash backends get their all-to-all from the `_flash_attention_forward` hook
+    do_all_to_all = ulysses_sp_size > 1 and "flash" not in str(attn_impl)
+
+    num_key_value_groups = self.num_key_value_groups
+    if do_all_to_all:
+        if attention_mask is not None and cu_seqlens is None and cu_seqlens_cpu is None:
+            # a mask means the batch is packed (or padded); without the global boundaries the
+            # segment loop below would let sample i attend to sample i-1. Fail loudly.
+            raise NotImplementedError(
+                "Qwen3.5 Ulysses SP needs `cu_seqlens` to rebuild the packing boundaries after the "
+                f"all-to-all, but got only a local-shard mask of shape {tuple(attention_mask.shape)}."
+            )
+        # repeat kv so the head count is divisible by sp (same rule as _ulysses_flash_attention_forward)
+        repeats = max(ulysses_sp_size // key_states.size(1), 1)
+        key_states = repeat_kv(key_states, repeats)
+        value_states = repeat_kv(value_states, repeats)
+
+        # (bsz, n_head, seq_len/sp, head_dim) -> (bsz, n_head/sp, seq_len, head_dim)
+        query_states = gather_seq_scatter_heads(query_states, seq_dim=2, head_dim=1)
+        key_states = gather_seq_scatter_heads(key_states, seq_dim=2, head_dim=1)
+        value_states = gather_seq_scatter_heads(value_states, seq_dim=2, head_dim=1)
+
+        # sdpa/eager re-expand kv using module.num_key_value_groups; after the repeat and
+        # scatter above that ratio is no longer the one stored on the module.
+        num_key_value_groups = query_states.size(1) // key_states.size(1)
+
+    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(attn_impl, eager_attention_forward)
+    attn_common = dict(
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
+
+    orig_groups = self.num_key_value_groups
+    self.num_key_value_groups = num_key_value_groups
+    try:
+        if do_all_to_all:
+            segments = _packed_segment_bounds(cu_seqlens_cpu, cu_seqlens, query_states.size(2))
+            outputs = []
+            attn_weights = None
+            for start, end in zip(segments[:-1], segments[1:], strict=True):
+                # attention_mask=None -> sdpa/eager take their own `is_causal` path, which is
+                # exactly right inside one packed sample and keeps the kernel O(n) in memory
+                out, _ = attention_interface(
+                    self,
+                    query_states[:, :, start:end],
+                    key_states[:, :, start:end],
+                    value_states[:, :, start:end],
+                    None,
+                    **attn_common,
+                )
+                outputs.append(out)
+            attn_output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
+        else:
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                **attn_common,
+            )
+    finally:
+        self.num_key_value_groups = orig_groups
+
+    if do_all_to_all:
+        # (bsz, seq_len, n_head/sp, head_dim) -> (bsz, seq_len/sp, n_head, head_dim)
+        attn_output = gather_heads_scatter_seq(attn_output, seq_dim=1, head_dim=2)
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = attn_output * torch.sigmoid(gate)
+    return self.o_proj(attn_output), attn_weights
+
+
 def qwen3_5_decoder_layer_forward(
     self,
     hidden_states: torch.Tensor,
@@ -359,13 +516,19 @@ def qwen3_5_decoder_layer_forward(
             cu_seqlens_cpu=cu_seqlens_cpu,
         )
     elif getattr(self, "layer_type", getattr(self, "block_type", None)) == "full_attention":
+        attn_kwargs = kwargs
+        if get_ulysses_sequence_parallel_world_size() > 1:
+            # `qwen3_5_attn_forward` needs the global (unsliced) packing boundaries to keep
+            # attention block-diagonal after the all-to-all -- HF's own mask is built from the
+            # local shard and is meaningless there. Only consumed when that patch is installed.
+            attn_kwargs = {**kwargs, "cu_seqlens": cu_seqlens, "cu_seqlens_cpu": cu_seqlens_cpu}
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             position_embeddings=position_embeddings,
-            **kwargs,
+            **attn_kwargs,
         )
 
     hidden_states = residual + hidden_states
