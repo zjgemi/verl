@@ -819,6 +819,31 @@ re.search(re.escape(key) + r':(-?\d+\.?\d*(?:[eE][+-]?\d+)?)', line).group(1)
 **`trisol train get -o json` 没有顶层 `envs` 字段** —— 提交时的环境变量在 `custom_config` 里，
 要核对某次任务实际带了什么 env（比如确认 treatment 真的生效）得去那里找。
 
+### 平台注入的 `MASTER_PORT` 落在临时端口范围内，会被随机抢占（2026-09-11）
+
+`coding-rl-nd267-spfix-0911` 第一次提交在 `actor_rollout_init_model()` 就挂了，
+**与镜像、SP 修复、flash 全无关系**：
+
+```
+verl/workers/engine_workers.py:88  initialize_global_process_group_ray(timeout_second=None)
+verl/utils/distributed.py:92       torch.distributed.init_process_group(init_method=None)
+DistNetworkError: server socket has failed to listen ... port: 36655, code: -98, EADDRINUSE
+```
+
+`init_method=None` ⇒ torch 走 `env://` rendezvous，读平台注入的 `MASTER_ADDR`/`MASTER_PORT`。
+**平台挑的 36655 落在 Linux 临时端口范围 32768–60999 之内**，于是 Ray / vLLM 开的任何
+出站 socket 都可能先把它抢走。是随机竞态，同配置的 nd267 当初没撞上。
+
+修法是把 rendezvous 端口钉到临时端口范围下界之外，在 command 最前面 export（`--env`
+会不会被平台注入覆盖不确定，export 在脚本里执行则一定赢）：
+
+```python
+command[2] = "export MASTER_PORT=29517; " + command[2]
+```
+
+**这一项不破坏单变量前提** —— 它只是 TCPStore 的地址，没有任何数值依赖它。
+`--backoff-limit 0` 意味着撞上就直接终止，所以值得预防性地钉住而不是靠重试。
+
 ### 训练量不足（2026-09-02 定位，仍然成立但不是唯一的墙）
 
 `coding-rl-a100-lora-9b-96k-30t-n8-8gpu-good27` 十步 metrics：
