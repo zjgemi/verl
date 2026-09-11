@@ -1317,6 +1317,13 @@ shard0 **恰好 0** 而 shard1 **0.372**；这里 sdpa 那 6.19e-03 两个 shard
 - `lbg sdbx exec`：**所有 flag 必须在 `sandbox_id` 之前**，用 `--cwd` 指定目录，
   命令要作为**单个 shell-quoted 参数**传（`-- bash -lc '...'` 不行，会在 `/root` 跑）。
 - `lbg sdbx template rm` 需要 `--force`。
+- **`lbg image commit --name` 必须带显式非 latest tag**（`--name verl-coding-spattn-fa:20260911`）,
+  否则 400 `TAG_REQUIRED`。而 `lbg sdbx template create` 反过来**拒绝** `:latest`,
+  `lbg sdbx create --image` 则两者都收 —— 三条路径的 tag 规则各不相同。
+- **集群镜像缓存预热会卡住 create**（400 `image preparation is still running` / `code: 10`），
+  新 commit 出来的镜像尤其容易卡几十分钟。**base 镜像 `verl-coding:202608292148` 一直是热的**,
+  所以要临时验证什么, 从 base 起沙盒 + `--mount-user-storage` 拿 `/personal` 里的补丁/wheel,
+  比等新镜像预热快得多（补丁脚本本来就是幂等自包含的）。
 - **`lbg image build` 只接受 ≤64 KiB 的 Dockerfile，没有 build context** ⇒
   要带进镜像的文件只能 base64 内联进 `RUN`。
   把 `--check` 和一次 `import` 放进同一个 `RUN`，补丁没打上就构建失败，等于自带验收。
