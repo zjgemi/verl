@@ -894,9 +894,43 @@ trisol train checkpoint download <job> <checkpoint-id> -o <dir>
 `rescan` 要求终态（running 时返回 409）。注意 `--no-output-model` 的 PFS 副本
 在任务终止 **7 天后永久删除**，rescan 要赶在这之前。
 
+### ★ 取 checkpoint 光改 prefix 不够，还要 `--checkpoint-scan-path`（2026-09-13）
+
 verl 写的 checkpoint 目录名是 `global_step_*`，而平台默认发现规则的 prefix 是
-`checkpoint-`，所以**默认情况下 checkpoint 也不会被归档** —— 要用同样的 rescan，
-prefix 改成 `global_step_`。
+`checkpoint-`，所以**默认情况下 checkpoint 不会被归档**。但**只把 prefix 改成
+`global_step_` 一样什么都扫不到** —— 发现规则是在**输出根**（`/trisol/output`）下扫
+**直接子目录**，而 verl 的 `trainer.default_local_dir=/trisol/output/checkpoints`
+⇒ 输出根下只有 `.trisol/` 和 `checkpoints/`，`global_step_*` 在**下面一层**。
+
+只改 prefix 的 rescan **不报错**，`checkpoint list` 就一直只有旧条目，
+看起来像"归档很慢"。我等了 50 分钟才想起来去 `train output ls` 看真实目录结构。
+
+```bash
+trisol train checkpoint rescan <job> --team infra-spot \
+  --checkpoint-scan-path checkpoints \
+  --checkpoint-prefix global_step_ --checkpoint-atomic
+```
+
+（`--checkpoint-scan-depth 2` 是另一条路，但它会用 scan-root 相对路径给 checkpoint 命名，
+不如 scan-path 干净。）
+
+**先 `trisol train output ls <job> --team infra-spot` 看清目录层级再定规则**，
+不要凭记忆猜。`output ls` 只有 `ls`、**没有下载子命令**，所以取文件只能走 checkpoint 通道。
+
+### 长跑任务的 `--checkpoint-prefix` 该给 `global_step_`，不是 `rollout_data`
+
+`opd-teacher27b-prod-0911` 提交时我写的是 `--checkpoint-prefix rollout_data --checkpoint-atomic`
+（从探针任务继承来的）。后果：平台在开跑 1.5h 时把 `rollout_data/` 归档了一份
+**3.2M 的早期快照**就再没动过，而真正想要的 `global_step_*` 全程没被归档，
+跑完还得补一次 rescan + 重新归档 155 GB。
+
+**提交长跑时 prefix 直接给 `global_step_`（配 scan-path），rollout 数据留到事后 rescan。**
+rollout 数据是纯追加的，事后取没有损失；checkpoint 则是越早归档越安全。
+
+单个 step 的体积参考（9B / LoRA / world_size=8）：`model_world_size_8_rank_*.pt`
+**2.38 GB × 8 = 19 GB**，加 optim 0.4 GB ⇒ **约 19.4 GB/step**。
+`SAVE_FREQ=5` 跑 40 步 = 8 个 checkpoint = **155 GB**，归档不是一会儿的事。
+注意这是**全量 FSDP shard（含基模权重）**，不是只有 LoRA adapter。
 
 ---
 
