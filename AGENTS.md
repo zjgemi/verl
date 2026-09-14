@@ -1694,8 +1694,10 @@ OPD 结果**之前**做的，它才是"新数可信"的依据。基线目录是
 `trajectories_qwen9b_base_with_rc`（**不是** `_base_full`，后者同子集给 137/266）。
 
 **三条限制，引用这个 0.6203 时必须一起说：**
-1. **没有留出集** —— OPD 训的是全部 800 题，这 266 道全见过。和 SFT 那次同样处境，
-   所以三方比较同口径可比，但**不能声称为泛化**。
+1. **没有留出集** —— ~~OPD 训的是全部 800 题，这 266 道全见过~~
+   **这句是我写错的，见下面「OPD 只跑了 0.4 epoch」一节：实际只有期望 40% 见过，
+   且每题最多见一次。** 但因为 `data.seed=null`，**无法识别是哪 320 题**，
+   所以仍然**不能声称为泛化** —— 理由从"全见过"换成"分不清哪些见过"。
 2. 只评了 step 40 单点（loss 在 ~step 10 后就饱和，但那是推断不是测量）。
 3. 每条轨迹只跑一次，没有重复采样的方差估计。
 
@@ -1786,3 +1788,49 @@ rollout 数据没了之后，唯一零成本的替代是训练日志里的 `val-
 **不要**把"轮数减半 + acc 没涨"直接读成 nd267 那个"中途自己停"的失败模式 ——
 那个判据需要 rollout 里的 `<final_answer>` 交出率和工具调用次数，
 **这两个量在只有验证 metrics 的情况下量不出来，r2 的 rollout 已经丢了。**
+
+### ★★ OPD 只跑了 **0.4 epoch**，每题最多见一次（2026-09-13，纠正我自己的错误记录）
+
+`opd-teacher27b-prod-0911`（2098353556137451520）的实际配置，从
+`trisol train get ... -o json` 的 `custom_config` 和命令尾部逐项读出来的：
+
+| 项 | 值 | 来源 |
+|---|---|---|
+| 数据集 | `coding-practice-800-train-27-val` | `datasets[0].wenyon_id` |
+| `TRAIN_BATCH_SIZE` | **8** | `custom_config.env` |
+| `ROLLOUT_N` | 4 | 同上 |
+| `++trainer.total_training_steps` | **40** | 命令尾部 override |
+
+⇒ `steps_per_epoch = 800 / 8 = ` **100**，跑的 40 步 = **0.4 epoch**。
+题目槽位 40×8 = **320 / 800（40%）**，轨迹 320×4 = **1280 条**。
+
+**`RandomSampler` 是不放回的**（`verl/trainer/ppo/utils.py:154,163`，
+torchdata 的 stateful `RandomSampler`，`replacement` 默认 False）⇒ 一个 epoch 内是 800 的一个排列，
+前 320 个就是训练过的，**剩下 ≥480 题一次都没见过**，见过的那 320 题**每题恰好一次**。
+
+**⇒ 本文件早先写的"OPD 训的是全部 800 题，这 266 道全见过"是错的。**
+期望只有 266×0.4 ≈ 106 道见过、约 160 道没见过。这让 `+0.1015 / p=0.0116` 那个阳性结果
+**更难用"背题"解释**（要靠 106 道单次见过的题撑起全部 +27 道净增）。
+
+**但识别不出是哪 320 题，所以补不成留出集分析：**
+
+- `data.seed` 默认 `null`（`verl/trainer/config/data/legacy_data.yaml:71`），
+  `run_coding_practice_qwen3_5_9b_4l20.sh` **也没有设**（grep `seed` 零命中）⇒
+  `create_rl_sampler` 走 `torch.Generator()` **不 manual_seed**，采样顺序**不可复现**。
+- `rollout_data` 归档只有 `1.jsonl`（3.3M，32 行 = 8 题 × 4）⇒ 只能认出 8 题。
+  （又是 `--checkpoint-prefix rollout_data` 那个坑，见「Trisol checkpoint 归档是一次性的」。）
+
+**以后提交 RL/OPD 一律显式给 `data.seed`**（例如 `++data.seed=42`），
+成本是一个字符串，收益是事后随时能重建"训练过哪些题"从而做留出集分析。
+想测泛化的正路仍然是 `split_data/test` 那 977 题（与 `train_sampled` 交集为 0，已实测）。
+
+**顺带对比 RL 的训练量口径**（两者不在同一个 regime，不要混着读）：
+
+| | 题库 | batch | steps/epoch | 跑的步数 | epoch 数 |
+|---|---|---|---|---|---|
+| `coding-rl-nd267-spfix-0911-r2` | 267 | 16 | 16.7 | 35 | **2.1** |
+| `opd-teacher27b-prod-0911` | 800 | 8 | 100 | 40 | **0.4** |
+
+RL 是"同一批题反复看到崩"，OPD 是"连一遍都没看完就停了" ——
+所以 OPD 那条 loss 在 ~step 10 饱和的**推断**不能当成"训练量够了"，
+step 40 之后还有 60 步才到第一个 epoch 边界。
