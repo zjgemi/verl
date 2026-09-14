@@ -925,7 +925,9 @@ trisol train checkpoint rescan <job> --team infra-spot \
 跑完还得补一次 rescan + 重新归档 155 GB。
 
 **提交长跑时 prefix 直接给 `global_step_`（配 scan-path），rollout 数据留到事后 rescan。**
-rollout 数据是纯追加的，事后取没有损失；checkpoint 则是越早归档越安全。
+~~rollout 数据是纯追加的，事后取没有损失~~ —— **这句是错的，见下节。归档是一次性的，
+错过的窗口永久取不回来。** 正确的做法是**同时**配好两条规则（checkpoint 用 scan-path
++ `global_step_` prefix，rollout 另起一条），不要指望"事后补"。
 
 单个 step 的体积参考（9B / LoRA / world_size=8）：`model_world_size_8_rank_*.pt`
 **2.38 GB × 8 = 19 GB**，加 optim 0.4 GB ⇒ **约 19.4 GB/step**。
@@ -1723,3 +1725,64 @@ True 165 / **None 72** / False 28 —— `None`（撞轮数上限没交答案）
   两次崩溃的 entropy 方向相反 ⇒ 本文件早先写的"entropy 坍缩是同源症状"**只对 nd267 成立**，
   不是崩溃的必要伴随。机制未查，**不要在这里填推测**。
 - `grad_norm` 全程 0.013–0.020，无趋势，崩溃期也没变 ⇒ 不是梯度爆炸/消失。
+
+### ★★ Trisol checkpoint 归档是**一次性**的，错过就永久取不回来（2026-09-13，代价 40 分钟 + 34 个 step 的 rollout）
+
+`coding-rl-nd267-spfix-0911-r2` 提交时我又写成了 `--checkpoint-prefix rollout_data`
+（**上一节已经写明不要这么干，我照着自己的记录又犯了一次**）。后果比上次严重：
+35 步的 rollout jsonl 和 7 个 `global_step_*` 全在 PFS 上，但平台只在开跑约 2h 时
+归档了一份 **8.1M 的 `1.jsonl`**（只有 step 1），**其余 34 步永久丢失**。
+
+试了 3 次 rescan + 1 次 delete 都救不回来，机制是这样的（证据链，不是猜）：
+
+1. **`rescan` 只 requeue *failed* 的归档** —— `rescan --help` 原文：
+   "A rescan also requeues a terminal **failed** archive whose source checkpoint is still complete"。
+   同名 checkpoint 已经是 `ready` 就**永远不会**重新归档，rescan 静默成功、列表纹丝不动。
+2. **`--checkpoint-atomic` 只匹配目录，不匹配文件** —— help 原文是
+   "every visible prefix-matching **directory**"。所以
+   `--checkpoint-scan-path rollout_data --checkpoint-prefix 1 --checkpoint-atomic`
+   压根扫不到 `1.jsonl`…`35.jsonl` 这 35 个**文件**，返回 0 个新条目也不报错。
+3. **`delete` 是软删除，字节还在，重建的记录会直接指回那份旧归档。**
+   `checkpoint delete <id> --yes`（**不加 `--yes` 会拒绝执行**）之后再 rescan，
+   确实出现了新 id，但 `list -o json` 里：
+   `file_count: 1`、`total_size_bytes: 8542558`（**恰好就是那个 1.jsonl**）、
+   `storage_path` 与被删的那条**完全相同**，而且
+   **`archived_at − created_at ≈ 0.09 s`** —— 320 MB 的拷贝不可能在 90 毫秒内完成，
+   ⇒ 没有发生任何新的归档动作。之后 `download --include '*'` 返回
+   "No files matched the selection"。
+
+**判据记住这个：新建的 checkpoint 记录如果 `archived_at` 与 `created_at` 相差不到 1 秒，
+就说明它复用了旧归档，没有真的去读 PFS。** 不要等、不要重试、不要再 delete。
+
+**⇒ 唯一可靠的做法是在提交时就把规则配对，长跑任务不要留"事后补"的余地。**
+
+### r2 的验证曲线：27 题验证集读不出 acc 信号，但 `num_turns` 读得出（2026-09-13）
+
+rollout 数据没了之后，唯一零成本的替代是训练日志里的 `val-core` 曲线（`TEST_FREQ=5`）。
+**验证集就是那 27 题**（所有 acc 都是 `k/27` 的整数商，`num_turns/mean=30.222=816/27`）：
+
+| step | val acc | 题数 | `num_turns/mean` | min | max |
+|---|---|---|---|---|---|
+| 0（未训练） | 0.3333 | 9 | 30.2 | 2 | 60 |
+| 5 | 0.4444 | 12 | 26.6 | 2 | 60 |
+| 10 | 0.4815 | 13 | 21.7 | 2 | 60 |
+| 15 | 0.6296 | 17 | 20.9 | 2 | 60 |
+| 20 | 0.4074 | 11 | 18.8 | 2 | 60 |
+| 25 | 0.5185 | 14 | 16.2 | 2 | 60 |
+| 30 | 0.3333 | 9 | 22.7 | 2 | 60 |
+| 35 | 0.2963 | 8 | 16.5 | 2 | 60 |
+
+- **acc 这一列读不出任何东西**：n=27、p≈0.45 的二项 sd = **0.096（2.6 题）**，
+  step0→25 斜率 +0.0055/step **t=+1.18**、全程 −0.0022/step **t=−0.61**，都不显著。
+  相邻两次 0.6296→0.4074 差 6 题 = 2.3σ，**是噪声而不是"step 15 到 20 之间崩了"**。
+  （这正是本文件早先那条"27 题验证集二项 sd≈9%，读不出信号 —— 验证集必须扩大"的实例，
+  这次是在事后被迫拿它当唯一数据源才吃到全部代价。）
+- **`num_turns/mean` 是这份日志里唯一有信号的量**：30.2 → 16.2，斜率 **−0.32/step、t=−3.36**。
+  验证集是固定的同一批 27 题，**难度被完全控住**，所以这个下降是真的行为改变。
+  `corr(acc, turns) = −0.194`（t=−0.48）⇒ 在 27 题的分辨率下，轮数减半**没有**换来 acc 提升。
+- `num_turns/max` **每一步都是 60**（=30 个 assistant 轮的上限 ×2）⇒ 始终有题撞顶；
+  `min` 恒为 2。所以均值下降不是"上限被削掉"，是分布整体左移。
+
+**不要**把"轮数减半 + acc 没涨"直接读成 nd267 那个"中途自己停"的失败模式 ——
+那个判据需要 rollout 里的 `<final_answer>` 交出率和工具调用次数，
+**这两个量在只有验证 metrics 的情况下量不出来，r2 的 rollout 已经丢了。**
