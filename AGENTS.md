@@ -567,6 +567,18 @@ p=0.35 去否定整条路线。
 耗时参考：267 道 / c=16 / 4×L20 ≈ **5 小时**（0.84 题/分钟）。要中途看就只看
 "有没有系统性故障"（`model` 字段对不对、有没有 `total_turns==0`），不看正确率。
 
+**★ 提交顺序已改成随机打乱（2026-09-16 起默认开）。** `discover_problems()` 原本是
+`sorted(base_dir.glob(...))` ⇒ 按**类目字母序**提交，所以中途读数有**两层**偏斜叠加：
+(a) 并发池里简单题先跑完，(b) 部分结果只覆盖字母序靠前的那批类目。
+**(b) 是可以修掉的**：`batch_run_trisol.py` 新增 `--shuffle-seed`（默认 **42**）与
+`--no-shuffle`（复现旧口径）。shuffle 放在 `discover_problems()` **之后** ⇒
+已有输出照常 skip，补跑缺题的 symlink 手法不受影响。
+实测前 290 道覆盖的类目数 **203 → 251**（全集 563 个类目）。
+
+**(a) 修不掉** —— 池子是 work-conserving 的，快的一定先回来。
+所以 **"中途不读正确率"这条规矩不因为 shuffle 而放宽**，shuffle 只是让
+"跑完的那批题"在**题目构成**上无偏，难度偏斜仍在。
+
 ### 待修：value_check 缺绝对容差（下次顺手改）
 
 `verl/utils/reward_score/coding_reward.py` 的 `value_check` 只有相对容差：
@@ -790,9 +802,34 @@ agent loop 的终止条件是"assistant 消息里没有 tool_call"，所以"中�
 
 ```bash
 trisol train logs <job> --team infra-spot --history \
-  --since 2026-09-08T05:00:00Z --direction forward \
+  --since 2026-09-08T05:00:00Z \
   --grep "training/global_step" --tail 5000
 ```
+
+### ★★ `--direction forward` 会静默丢掉最新的日志（2026-09-16，我照抄自己的配方踩的）
+
+上面这条命令**以前写的是 `--direction forward`，那会漏步数**。同一个任务、同一个
+`--since`（`created_at`）、同一个 `--tail 5000`、同一个 `--grep`，只差方向：
+
+| | 返回 |
+|---|---|
+| `--direction forward` | step **1–18**（18 行） |
+| 不给 / 默认（backward） | step **1–24**（24 行，全部） |
+
+forward 给的是从 `--since` 起**最早**的一批并在远小于 `--tail` 的地方截断（机制不明，
+只记现象）。我据此报了"step 18"，用户当场纠正实际是 23–24 步。
+⇒ **取当前进度一律不给 `--direction`**；forward 只在明确要看"开头那几步"时用。
+
+**报进度前必做时间自洽性检查**，它能独立抓住这类漏数据：
+
+```
+步数 × mean(timing_s/step) + 启动开销 ≈ now − created_at
+```
+
+本次：24 × 6465s = 43.1h + 1.6h = 44.7h，`created_at` 09-14 04:40 + 44.7h = 09-16 01:22，
+与当前时刻吻合；而 18 步只推到 09-15 14:10，**比当时时间早 11 小时** —— 一算就露馅。
+（`--tail`、`--since`、`--direction` 任一处出问题都会表现为"步数偏少"，
+所以这个检查是对**整条取数链路**的验证，不是只针对方向。）
 
 （`--since` 用 `trisol train get` 里的 `created_at`。`--grep` 是**纯子串**不是正则。
 另外 `--tail` 对已终止的多节点任务在**非** `--history` 模式下会报
@@ -1526,6 +1563,35 @@ vLLM 0.26.0 可用，`import sglang` → `ModuleNotFoundError`。
 - 提交用 `--nodes 2 --gpus-per-node 8`（**没有** `--node-count` 这个 flag），
   多节点还要 `--transport rdma --rdma-custom-image-ack`。
 
+### ★★ 单节点任务**一个都不注入**，多节点 launcher 直接复用会死（2026-09-17）
+
+上面那句"平台注入 `NODE_RANK` / `MASTER_ADDR` / `NNODES` / `WORLD_SIZE`"**只对多节点成立**。
+`--gpu-count 8`（单节点）实测这四个全是**空**的：
+
+```
++ TOTAL=16                                  <- ${WORLD_SIZE:-16} 落到硬编码默认
++ HEAD=:6379                                <- ${MASTER_ADDR} 为空
++ export RAY_ADDRESS=:6379
++ echo '=== rank= host=... nnodes= world=16 ==='    <- NODE_RANK / NNODES 全空
+ValueError: Malformed host:                 <- ray.init() 读了 RAY_ADDRESS=":6379"
+```
+
+`opd-flashnext-7809-bs128n1-0916` 就这么在 **47 秒**挂掉（`--backoff-limit 0` ⇒ 直接终态）。
+**`ray start --head` 其实成功了**（日志里有 `Ray runtime started`），死在后面那个
+`ray.init(address="auto")` 的就绪探针上 —— 所以看到 "Ray 起来了" 不代表 bootstrap 通了。
+而且 `TOTAL=16` 还会让就绪探针等 16 张卡等到超时，是第二个独立的死法。
+
+修法两行，双向兼容（`NODE_RANK` 空走 `${NODE_RANK:-0}` 恰好是 head 分支，不用改）：
+
+```bash
+TOTAL=${WORLD_SIZE:-$NG}
+[ -n "${MASTER_ADDR}" ] || MASTER_ADDR="${TRISOL_POD_IP:-127.0.0.1}"
+HEAD="${MASTER_ADDR}:6379"
+```
+
+⇒ **多节点 launcher 改单节点跑之前，先把所有 `${平台变量:-硬编码}` 的默认值过一遍**，
+那些默认值是按 2 节点写的，单节点下会静默生效。
+
 ## ★ mktemp 的工具配置在多节点下 FileNotFoundError
 
 `run_coding_practice_qwen3_5_9b_4l20.sh:92-96` 用 `mktemp /tmp/coding_tools_XXXXXX.yaml`
@@ -1577,8 +1643,14 @@ k1 的 student logprob 来自 FSDP，teacher logprob 来自 vLLM，权重相同 
 ```
 actor/grad_norm            : 0.455    ← RL 那几次是 0.01–0.05
 actor/distillation/loss_min: -22.71
-actor/distillation/loss_max:   7.73   (loss_max_clamp=10.0 未触顶)
+actor/distillation/loss_max:   7.73   (loss_max_clamp=10.0 未触顶, **仅此自蒸馏成立**)
 ```
+
+**⚠️ "未触顶"只是自蒸馏的性质，不要当成通例。** 真教师跑的
+`opd-27b-7809-bs128n1-0914` 里 `loss_max` **每一步都是 14.7–26.7**，
+默认 `loss_max_clamp=10.0` **一直在起作用**。clamp 发生在 range 指标记录**之后**
+（`losses.py:263-265`），所以 `loss_min`/`loss_max` 报的是**未截断**的原始 `d_t`，
+看到它超过 10 不代表 clamp 没配，恰恰相反。
 
 这 0.455 **全部由引擎偏差驱动，且是系统性偏差不是零均值噪声** —— 方向上把 FSDP 的 student
 往 vLLM 的数值行为上拽；单 token 尾巴到 −22.7 说明偏差分布重尾。
@@ -1669,6 +1741,230 @@ actor/distillation/loss_max:   7.73   (loss_max_clamp=10.0 未触顶)
 **1100 倍**——"27B 有真实信号"这个结论更强了。但 `abs_loss=0.2571` 里约 0.2 是引擎偏差，
 **27B 那步必须在修复后的镜像上重跑**，否则读不出纯教学信号的量级。
 
+### 三个同名的 `distillation/*` 量是**不同的东西**，不是同一个量的统计（2026-09-15 读代码）
+
+| 指标 | 是什么 | 出处 |
+|---|---|---|
+| `distillation/loss_min` / `loss_max` / `mean_loss` | 逐 token 的 `d_t = logπ_student(y_t) − logπ_teacher(y_t)` 的极值/均值，**clamp 之前** | `compute_distillation_loss_range()` |
+| `distillation/abs_loss` | 同一个 `d_t` 的 **token-mean 绝对值** | `..._reverse_kl_estimator` |
+| `actor/distillation/loss` | **PPO surrogate 标量**（token-mean），才是进梯度的那个 | `distillation_ppo_loss` |
+
+因为 `y_t ~ student`，`E[d_t] = KL(student‖teacher)`（**reverse** KL），单位 **nats/token**。
+符号：`d_t > 0` = student 比 teacher 更自信 ⇒ 压下去；`d_t < 0` = teacher 更喜欢 ⇒ 抬上来。
+
+`use_policy_gradient=True` 时 `advantages = -distillation_losses.detach()` 送进 vanilla PPO，
+**ratio≈1 时 surrogate 数值上退化成 `mean(d_t)`** —— 实测 `distillation/ppo_kl=4.2e-05`、
+`pg_clipfrac=3.3e-04` ⇒ ratio 确实钉在 1，所以 `actor/distillation/loss` 可以直接当平均
+reverse KL 读。`use_task_rewards=False` 时它与 `actor/loss` **逐位相同**（实测 0.054208063）。
+
+### ★★ 评测结果以 `results.md` 为准，目录名不能靠猜（2026-09-15，我自己踩的）
+
+**`/personal/sp2/qwen_trajs/cc_deepseek_1w/results.md` 是评测结果的权威表**，
+里面声明了每一行对应哪个 `trajectories_*/` 目录。按目录名望文生义会取错数据：
+
+我要评 27B 的 teacher SFT，`ls` 看到 `trajectories_qwen27b_sft_rc_60k_train/`（名字最像），
+算出 0.5032、`Δ=−0.0089 / p=0.597`，据此下了"**同一份数据在 27B 上收益归零**"的结论。
+**全错。** 正确目录是 `trajectories_qwen27b_teacher_v2/`（results.md 里写着），
+重算 `27B base 0.5095 → 0.5613，Δ=+0.0518，McNemar p=5.81e-4`，**显著为正**。
+
+**最刺眼的是判据在我手里没用**：我把 `models=Counter(...)` 打印出来了，
+那个目录的 `model` 字段是 **`qwen3-5-27b`** —— 正是 results.md 末尾注明的
+"2026-09-03 之前的 SFT 评测数字作废（LoRA 未生效，实际测的是基模）"那个坑。
+`model` 回显基模名而不是 LoRA key，说明请求根本没打到 adapter，难怪 ≈ base。
+
+⇒ **两条硬规矩**：
+1. 评测前先 `cat results.md` 拿目录映射，不要 `ls` 之后按名字猜。
+2. `model` 字段不是"顺手打印一下"，**它是判据**：值必须等于那个 LoRA key，
+   等于基模名就直接作废，不要继续算下去。
+
+**噪声基线（results.md 记录）**：同一个模型重跑一次，总体准确率漂 **±1pp**，
+但**逐题判定有 14% 翻转** ⇒ 模型间差异小于约 2pp 一律不可信，
+**必须配对检验，不能比原始准确率之差**。
+
+### SFT 收益随基模变强而递减，但**不归零**（2026-09-15，修正后的全图）
+
+全部同 harness（`batch_run_trisol.py -c 16`、`agent_trisol.py`、单跑一次、
+`eval.correct is True` 为正确、`None` 计 FAIL），train_sampled 800 题：
+
+| 对比 | Δ | McNemar p |
+|---|---|---|
+| 9B base 0.2313 → 9B merged 0.3550 | **+0.1237** | 1.67e-14 |
+| 27B base 0.5095 → 27B teacher-v2 0.5613 | **+0.0518** | 5.81e-4 |
+| 9B base → 27B base | +0.2785 | 1.55e-52 |
+| 9B merged 0.3577 → 27B teacher-v2 0.5630 | +0.2053 | 2.28e-31 |
+
+同一份 qwen3.7-plus 数据，9B 上 +12.4 点、27B 上 +5.2 点。**看着像减半，
+但按"吃掉 teacher−base 缺口的比例"算是一样的**：teacher(3.7-plus) = 0.688，
+9B 缺口 45.7 点吃掉 27.1%，27B 缺口 17.8 点吃掉 29.1%。
+⇒ **SFT 的效率与基模尺寸无关，变的只是缺口本身。**
+不要用"大模型学不动"解释 27B 的小 Δ。
+
+### ★★ `critic/score/mean` 在 `ROLLOUT_N=1` 下是**留出集读数**，但噪声地板 0.036（2026-09-16）
+
+`opd-27b-7809-bs128n1-0914`（bs128 × n=1 / 7808 题 / `data.seed=42`）。两条都要记住：
+
+**1. 它是免费的留出集。** `RandomSampler` 不放回 + `n=1` ⇒ 每步的 128 道题在本 epoch 内
+**从没训过**（27 步用掉 3456/7808 = 44.3%，无重复）。不像 RL 那样被"同一批题反复看"污染，
+**每步是一次无偏泛化估计**。（`use_task_rewards=False` 下它不进梯度，纯记录。）
+
+**2. 噪声地板正好是二项 sd，别拿单步差值说事。** 每步 128 道**不同**的题、每题 1 条 rollout
+⇒ `sd = sqrt(p(1−p)/128) = 0.0357`（题目难度异质**不会**让它变大：每题只抽一次，
+`Var = E[p(1−p)]/n + Var(p)/n = p̄(1−p̄)/n` 精确相消）。实测 27 步 sd = **0.0400**
+⇒ 超出部分只有 0.018，**几乎全部步间波动都是"这批抽到什么题"**。
+
+**⇒ 选窗口比大小必须做置换检验。** 实测：肉眼选出的 `21-26 vs 11-20` 是 Δ=+0.0508 /
+Welch **p=0.005**，看着很硬；但把"所有连续切分里最大的 Δ"当统计量、打乱步序重算 20000 次，
+观测值 +0.0610（最优切法是 18-20 vs 21-27，比肉眼选的还极端）对应 **p=0.135**。
+**诚实的单一判据是全程线性趋势：+0.00176/step，t=+1.86，p=0.075 —— 还没显著。**
+
+功效换算（斜率维持的话）：t 越过 2 在 ~28 步、2.5 在 ~33 步、3.0 在 ~37 步；
+按 1.78 h/step 算再跑 10 步（约 18 h）就能到 t=3。**别在 27 步上硬读。**
+
+交叉验证成立：训练侧 1-10（0.193）vs 11-20（0.195）持平，与评测侧
+step20 vs step10 `Δ=−0.0034 / p=1` 吻合 —— 两个口径互相印证。
+
+### ★★★ OPD 不涨点的直接测量：位移小 + 增量方向近正交（2026-09-16）
+
+不要靠 loss 曲线猜"模型动没动"，**直接量 LoRA 的 `ΔW/W`，几分钟、不用 GPU**
+（方法见「SFT loss 平不能推断没学到」那节的迹恒等式）。三个 checkpoint 实测
+（12 个模块中位，base shard1 覆盖）：
+
+| | `ΔW/W` | 训练量 |
+|---|---|---|
+| OPD step10（bs128×n1） | **0.1029%** | 1280 轨迹 / 80 次更新 |
+| OPD step20（bs128×n1） | **0.1391%** | 2560 / 160 |
+| OPD step30（bs128×n1） | **0.1725%** | 3840 / 240 |
+| OPD step40（bs128×n1） | **0.2012%** | 5120 / 320 |
+| OPD step40（bs8×n4，另一个 run） | 0.107% | 1280 / 80 |
+| 自采样 SFT（**阴性**） | 0.256% | 72 步 |
+| teacher SFT（有效） | 0.547% | 234 步 |
+
+**⇒ 跑到 step40、4 倍训练量之后，位移仍低于那个 p=0.35 的阴性自采样 SFT（0.256%），
+只有有效 teacher SFT 的 37%。**（跨方法可比：都是同基模 + LoRA r32 α64。）
+
+### √t 标度一路成立到 step40（2026-09-17 四点实测）
+
+| 段 | 增量范数 `ΔW/W` | `cos(增量, 之前的累积)` |
+|---|---|---|
+| 0→10 | 0.1029% | — |
+| 10→20 | 0.0806% | **0.1703** |
+| 20→30 | 0.0858% | **0.1667** |
+| 30→40 | 0.0847% | **0.1427** |
+
+**每段走的距离几乎恒定（0.081–0.086%），方向始终近正交（cos 0.14–0.17，略降）。**
+`st40/st10 = 0.2012/0.1029 = ` **1.955 ≈ √4** ——
+4× 训练量（1280→5120 轨迹、80→320 次更新）恰好换来 2× 位移，
+**随机游走标度到 step40 都没有变成定向行走。**
+
+这与评测侧四点持平（step10/20/30/40，见上面那节）、训练侧
+`critic/score/mean` 21-30 与 31-37 持平，是同一幅图像的三个侧面。
+
+**★ "cos(增量, 累积)"的参照向量有歧义，两个数差 4 倍，必须写清楚用的哪个：**
+
+| 定义 | 10→20 | 20→30 | 30→40 |
+|---|---|---|---|
+| **增量 vs 段首的累积**（本文件一贯口径） | 0.1703 | 0.1667 | 0.1427 |
+| 增量 vs 段末的累积 | 0.52 | 0.59 | 0.68 |
+
+后者看起来像"越来越定向"，**那是定义造成的假象** —— 段末累积里本来就含这一段增量，
+两者必然越来越像。**一律用前者。**
+
+**★ 同一 run 内 `lora_A` 会漂，不是常数**（2026-09-17 纠正本文件早先的说法）。
+我之前写的"`cos(A10,A20)=1.0000`，verl 下 A 在训练中不变"是**四位小数的舍入假象**，
+实测 `cos(A10,At)` = 0.99998766 / 0.99990… / **0.99962360**，相对变化 2.7e-03 … 2.6e-02。
+
+⇒ **范数分解不受影响**（每个 step 用自己的 A，见下面配方 1 的拼接写法），
+但**任何建立在"同一子空间"上的论证都作废** —— 比如"Δ10 和 Δ20 在同一 rank-32 行空间里
+所以余弦可以直接读成梯度方向的重合度"。余弦仍是良定义的 Frobenius 夹角，
+但它同时含了 A 漂移的贡献，**不能纯粹解释成"梯度方向互相抵消"。**
+
+**★ 跨 run 的方向余弦在 LoRA 上结构性不可做。** 我先算出"两个独立 OPD run 的
+ΔW 方向 `cos=0.0034`，完全正交"，差点当成"OPD 学到的全是噪声"的铁证。**错的**：
+两个 run 的 `lora_A` 是不同随机初始化（`cos(A10,A40)=0.0016`，行空间主角 cos 0.077
+≈ 随机基线 `sqrt(r/d)=0.088`），`ΔW = B@A` 被约束在 A 张成的 rank-32 行空间里，
+**子空间不同 ⇒ 即使真实梯度方向相同 cos 也必然≈0**。做跨 run 方向比较前
+必须先验 `cos(A_run1, A_run2)`。
+
+**算增量和夹角的三个配方**（都保持在 `(r,r)` / `(2r,2r)` 规模，不物化 `(out,in)`）：
+
+```python
+# 1) 增量范数: ΔW20 − ΔW10 = [B20 | −B10] @ [A20 ; A10]  再套迹恒等式
+#    这个拼接写法对 A20 != A10 也成立, 所以上面那条 "A 会漂" 不影响它
+B = torch.cat([B20, -B10], dim=1); A = torch.cat([A20, A10], dim=0)
+fro = torch.trace((B.T@B) @ (A@A.T)).clamp(min=0).sqrt() * (alpha / r)
+# 2) 内积: <ΔW10, ΔW20>_F = tr((B10.T@B20) @ (A20@A10.T)) * (alpha/r)**2
+# 3) 夹角: cos(增量, 累积) = (r20**2 - r10**2 - ri**2) / (2*r10*ri)   余弦定理
+```
+
+**别忘了 `scale = alpha/r`**（这里是 2）。漏掉它 `ΔW/W` 小一半（0.051% vs 0.103%），
+而**比值和余弦都是 scale 不变的** ⇒ 只有绝对值错，其余一切自洽，最容易蒙混过关。
+自检：两条不同路径算出的增量范数必须对上。
+
+**lr 的证据：有上调空间，但这个判据在 OPD 下要打折。** 实测全 27 步
+`lr` 恒定 **1.5e-5（无 warmup、无 decay）**、`grad_norm` 0.06–0.09 **稳定不衰减**、
+`distillation/ppo_kl` **2–4e-05**、`pg_clipfrac` **3e-04** —— 后两个比健康区间
+（clipfrac 0.1–0.2）低 2–3 个数量级，表面签名与 2026-09-02「RL 推不动是 lr 太小」完全相同。
+**但不能照搬**：OPD 下 `use_policy_gradient=True` + `ppo_epochs=1` 使 ratio 结构性钉在 1
+（surrogate 退化成 `mean(d_t)`，见「三个同名 distillation/* 」那节），clipfrac 低有一部分
+是定义决定的。`ppo_kl=2e-5` 那条仍然干净 —— 每次更新后策略变化确实极小。
+
+**未知，不要在这里填推测**：为什么同一 run 内增量方向近正交。一个结构性候选
+（读代码得出，**未验证**）是 on-policy 的分布漂移 —— student 每步重新采样，
+梯度方向本来就不固定；`distillation/loss` 从 step3 起 27 步无下降趋势（0.046–0.055）
+与此一致，但同样区分不了"靠近太慢"和"漂移吃掉收益"。要分开需要一个 off-policy
+固定数据集的蒸馏对照跑同样的量。
+
+### ★★ bs128/n=1 的 step10 评测：等预算对照下 **`ROLLOUT_N=4→1` 无差别**（2026-09-16）
+
+`opd-27b-7809-bs128n1-0914` 的 step10 checkpoint（`TRAIN_BATCH_SIZE=128`、`ROLLOUT_N=1`、
+`PPO_MINI_BATCH_SIZE=16`、7809 题库、`++data.seed=42`）vs `opd-teacher27b-prod-0911` 的 step40
+（bs8 × n=4），**四方公共集 n=776**（同 harness、`eval.correct is True` 为正确、`None` 计 FAIL）：
+
+| | 正确 | 率 |
+|---|---|---|
+| SFT-merged | 280/776 | 0.3608 |
+| OPD step40（bs8×n4） | 229/776 | 0.2951 |
+| **OPD step10（bs128×n1）** | **213/776** | **0.2745** |
+| 基模 | 183/776 | 0.2358 |
+
+| 对比 | Δ | 95%CI | 配对(both/only_b/only_a/neither) | p |
+|---|---|---|---|---|
+| step10 vs 基模 | **+0.0387** | [+0.010,+0.067] | 134/79/49/514 | **0.0101** |
+| **step10 vs step40** | **−0.0206** | [−0.049,+0.008] | 159/54/70/493 | **0.178** |
+| step10 vs SFT-merged | −0.0863 | [−0.116,−0.057] | 175/38/105/458 | 1.89e-08 |
+
+**这是一个刻意配成等预算的干净对照** —— 三项训练量全同，唯一变量是题目多样性 4×：
+
+| | 轨迹数 | 题目数 | 优化更新 |
+|---|---|---|---|
+| step40（bs8×n4，mini4） | 1280 | **320** | 40×2 = 80 次 × 16 条 |
+| step10（bs128×n1，mini16） | 1280 | **1280** | 10×8 = 80 次 × 16 条 |
+
+⇒ **`p=0.178`、CI 跨 0：把 `ROLLOUT_N` 从 4 降到 1、题目多样性翻 4 倍，结果不变。**
+这确认了「OPD 里 `rollout.n` 是惰性参数」那节的推论在**结果侧**成立：
+n=1 不吃亏（也没白赚），省下的预算换成题是安全的。相关 [[opd-rollout-n-inert]]。
+
+**自校验先做再读新数**：同一脚本在 776 集上重算 `base → merged` 得 `+0.1250 / p=2.81e-14`，
+与本文件记的 789 集 `+0.1242 / p=2.63e-14` 吻合。
+
+**15 题 `rc=1` 的死因与 step40 那次逐字相同**：`--max-model-len 262144` 撞顶 ⇒
+`maximum context length is 262144 tokens ... prompt contains at least 262145 input tokens` ⇒
+重试 3–4 次全败（日志里 40 次 400）⇒ `agent_trisol.py` **优雅退出 `sys.exit(1)`、0 个 traceback**，
+不写输出文件。上下界 0.2675–0.2863 都夹在基模与 merged 之间，结论不变。
+（其中 1 条报的是 `prompt contains 988560208 characters` —— 约 9.9 亿字符，
+某次工具返回炸了，这个还没查。）
+
+**`batch_run_trisol.py` 的 `subprocess.run(..., text=True)` 不捕获 stdout/stderr**
+⇒ 子进程输出全部继承到父进程的重定向文件里（本次 **1.1 GB**）。找单题死因不能靠
+`grep Traceback`（沙盒里模型自己写的代码报错有 545 个 traceback、521 个 AttributeError，
+全是噪声），要 grep **API 错误原文**或 `File ".../agent_trisol.py"`（后者为 0 即优雅退出）。
+
+**进度条卡住 ≠ 死了**：我看到 785/800 十小时没动就判定 runner 死了，**错的**。
+`ps aux | grep batch_run_trisol` 当时只匹配到**上一个 session 残留的 shell wrapper**
+（它的命令行里含有那个字符串），真正的 python runner 早已不在。而实际情况是评测**已经跑完**
+（最慢一条 7571s，尾部长轨迹在收尾）。⇒ 判死活要看 `grep -E '^ *\[[0-9]+/800\]'` 的进度行
+和日志末尾的 `Total:` 汇总，**不要用 `ps | grep <脚本名>`**，wrapper 会假阳性。
+
 ### ★★★ OPD step40 评测：**阳性**，第一个统计显著的正结果（2026-09-13）
 
 `opd-27b-step40`（27B 教师 / k1 / `use_task_rewards=False` / SP 修复后的镜像
@@ -1758,6 +2054,74 @@ True 165 / **None 72** / False 28 —— `None`（撞轮数上限没交答案）
 
 **⇒ 唯一可靠的做法是在提交时就把规则配对，长跑任务不要留"事后补"的余地。**
 
+### ★★ `expired` 的归档记录**能救回来**，但必须先 delete（2026-09-17，与上节互补）
+
+上节说的是"`ready` 的记录 rescan 不动、delete 之后会复用旧字节"。
+**`expired` 是另一种状态，救法相反、而且真能救。**
+
+`opd-27b-7809-bs128n1-0914` 停任务时 `global_step_40` 正在归档，被打断后记录停在：
+
+```
+id 2100454166219460608  status expired  file_count 0  total_size_bytes 0
+created_at 2026-09-17T05:17:52Z  archived_at None
+```
+
+- **`rescan` 对它无效** —— help 只承诺 requeue 终态 **failed** 的归档，`expired` 不在其列，
+  rescan 静默成功、列表纹丝不动（与上节 `ready` 的表现相同，都是"什么都没发生"）。
+- **delete 在这里是安全的**，判据就是那三个零：`file_count=0 / total_size_bytes=0 /
+  archived_at=None` ⇒ **没有任何旧字节可供复用**，不存在上节那个"复用旧归档"的陷阱。
+  （`ready` 且 `file_count>0` 的记录**不要** delete，那才是上节的坑。）
+- delete 之后 rescan，新记录 `2100463920228601856`：
+  `created 05:56:37 → archived 05:58:37`，**耗时 120 秒**、32 文件、19,471,457,084 B
+  ⇒ 通过上节的"`archived_at − created_at ≫ 1 s`"判据，是真归档。
+
+**前提是 PFS 上的字节还在**（`--no-output-model` 的副本在任务终止 7 天后才删）。
+delete 之前先 `trisol train output ls <job> --team infra-spot` 逐文件核对。
+
+### ★ 完整性自检必须包含**顶层** `data.pt`（2026-09-17，我自己的脚本 bug）
+
+verl LoRA checkpoint（9B / world_size=8）的完整签名是 **32 文件 / 19,471,457,084 B**：
+
+| 文件 | 数量 × 字节 |
+|---|---|
+| `actor/model_world_size_8_rank_*.pt` | 8 × 2,379,519,256 |
+| `actor/optim_*.pt` | 8 × 51,896,487 |
+| `actor/extra_state_*.pt` | 8 × (15205 / 15141) |
+| `actor/fsdp_config.json` / `lora_train_meta.json` | 46 / 67 |
+| `actor/huggingface/*` | 5 个（tokenizer.json 19,989,325 最大） |
+| **`data.pt`（顶层，不在 `actor/` 下）** | **7,316** |
+
+我的校验脚本 glob 根在 `actor/`，于是算出 19,471,449,768 ≠ 19,471,457,084 报
+`INTEGRITY FAIL`，**差额恰好 7316 = `data.pt`**。下载其实是完好的。
+⇒ **对不上先看差额是不是等于某个已知文件**，不要直接判下载失败重下 19.5 GB。
+
+### ★ `trisol model upload` 之前必须先 `trisol model create`（2026-09-17）
+
+upload 的 help 原文是"upload a new version of **the given model**" —— 模型不存在时：
+
+```
+Error: resolve model "opd-bs128-step40": no model matching "opd-bs128-step40" (code=E_ERROR)
+```
+
+看起来像权限/命名问题，其实只是没建。顺序是：
+
+```bash
+trisol model create opd-bs128-step40 --team infra-spot -o json     # 返回**模型 id**
+trisol model upload opd-bs128-step40 <dir> --team infra-spot --version 1 --progress plain
+#   末尾打印的裸数字是**版本 id**, 不要填进 adapters[].model_id (见上面那节)
+```
+
+### ★ inference 的 `endpoint` 字段是 `None`，真地址在 `public_endpoint_url`（2026-09-17）
+
+服务 `running 4/4` 时 `trisol inference get <id> -o json` 的 `endpoint` **仍然是 null**，
+容易误判成"还没就绪"。要用的字段：
+
+| 字段 | 值 |
+|---|---|
+| `public_endpoint_url` | `https://<alias>.w1.inference.trisol.dp.tech` ← **评测用这个** |
+| `internal_endpoint_url` | 集群内地址 |
+| `domain_alias` | 那个 alias |
+
 ### r2 的验证曲线：27 题验证集读不出 acc 信号，但 `num_turns` 读得出（2026-09-13）
 
 rollout 数据没了之后，唯一零成本的替代是训练日志里的 `val-core` 曲线（`TEST_FREQ=5`）。
@@ -1834,3 +2198,843 @@ torchdata 的 stateful `RandomSampler`，`replacement` 默认 False）⇒ 一个
 RL 是"同一批题反复看到崩"，OPD 是"连一遍都没看完就停了" ——
 所以 OPD 那条 loss 在 ~step 10 饱和的**推断**不能当成"训练量够了"，
 step 40 之后还有 60 步才到第一个 epoch 边界。
+
+### ★★ OPD 里 `rollout.n` 是**惰性参数**，多 rollout 换不到任何东西（2026-09-14，读代码定案）
+
+`opd-teacher27b-prod-0911` 用的是 `TRAIN_BATCH_SIZE=8 × ROLLOUT_N=4`。**那 4× 是白花的。**
+
+`verl/trainer/distillation/losses.py` 在 `use_policy_gradient=True` 时
+`advantages = -distillation_losses.detach()` —— **逐 token，只由 teacher/student 的 logprob 差决定，
+不含任何组内统计量**。而 `ppo_loss` 那一支（真正消费上游 `adv_estimator` 算出的 advantage 的地方）
+被 `use_task_rewards=False` 先置零再加回 `distill_loss × 1.0`。
+⇒ RLOO/GRPO 那套"同题多条互为 baseline 降方差"的机制在 OPD 里**结构上不存在**。
+
+顺带：`algorithm.adv_estimator=grpo` 来自 run 脚本 `:107`，从来没被覆盖过，
+所以它**算了但被丢掉**。看到日志里有 grpo 不要以为在起作用。
+
+`n` 剩下的两个真实影响，改 n 时必须一起调否则悄悄变了两个变量：
+
+1. **每步 token 数** = `batch × n`。要保持步时长和沙盒并发不变，就得让 `batch × n` 不变。
+2. **`ppo_mini_batch_size` 会被乘上 `rollout.n`**（`ray_trainer.py:1316,1346`；
+   `trainer_base.py:1605,1628`）⇒ 每步内层更新次数 = `batch×n / (mini×n)`。
+   prod 是 `mini=4 × n=4 = 16` 条/mini、2 次内层更新；换 n=1 要写 `PPO_MINI_BATCH_SIZE=16` 才等价。
+
+**`n=1` 对 GRPO 路径是安全的**（哪怕 advantage 会被丢弃，它仍会被算一遍）：
+`core_algos.py:315-317` 显式处理组大小 1（`id2mean=0.0`、`id2std=1.0`），不会除零。
+
+⇒ **OPD 一律 `ROLLOUT_N=1`**，把预算全换成不同的题。同样的 32 条轨迹/步，
+n=4 是 8 道题、n=1 是 32 道题，**每步题目多样性 4×**。
+
+### `TEST_FREQ` 设很大**不能**关验证，必须 ≤ 0（2026-09-14）
+
+`ray_trainer.py:1690-1691`：
+
+```python
+if test_freq > 0 and (is_last_step or global_steps % test_freq == 0):
+```
+
+`is_last_step` 是 **OR** 进去的 ⇒ `TEST_FREQ=100000` 仍然会在最后一步跑一次**完整**验证
+（976 题验证集按单条 ~1 小时的 gen 量级，是实打实的代价）。
+只有 `test_freq <= 0` 才整个短路。同理 `val_before_train` 是独立的门（`:1401`），
+要一起关：`++trainer.val_before_train=False`。
+
+### `trisol train submit` 只能配**一条** checkpoint 发现规则（2026-09-14，纠正本文件早先的说法）
+
+上面「长跑任务的 `--checkpoint-prefix`」那节写的"**同时**配好两条规则（checkpoint 用 scan-path
++ `global_step_` prefix，rollout 另起一条）"——**做不到**。
+`--checkpoint-prefix` / `--checkpoint-scan-path` / `--checkpoint-atomic` 三个 flag 都是**单值**的，
+没有可重复的语法。而且 `--checkpoint-atomic` 的 help 原文是
+"every visible prefix-matching **directory**" ⇒ 它匹配不了 `rollout_data/*.jsonl` 这种**文件**。
+
+⇒ 长跑任务只能二选一。**选 `global_step_`（配 `--checkpoint-scan-path checkpoints`）** ——
+权重错过了就真没了；rollout jsonl 虽然也是一次性归档（见「归档是一次性的」），
+但可以用 `++data.seed=<N>` 本地重建"训练过哪些题"来补偿大部分需求。
+
+### `filter_overlong_prompts=True` 会静默丢题，seed 复现必须在**过滤后**的帧上做（2026-09-14）
+
+`coding-practice-rl:7` 的 train 是 **7809** 行，但日志里是：
+
+```
+dataset len: 7809
+filter dataset len: 7808
+```
+
+`rl_dataset.py:197+` 的 `maybe_filter_out_long_prompts` 是保序的 `dataframe.filter`，
+用**和 rollout 同一份工具 schema** 渲染 chat template 后按 `max_prompt_length=16384` 截。
+本地用 `/personal/Qwen/Qwen3.5-9B` 的 tokenizer 重算（**不含**工具 schema 前缀）：
+max **25714** / p99 3515 / median 1522，超 16384 的**恰好 1 条**：
+
+```
+row 530  len 25714  BWA_Indexing_a_reference_genome_with_bwa_index_Build_the_FM-
+row 390  len 14964  <- 次长, 加上工具前缀仍在线下(平台只丢了 1 条, 与此一致)
+```
+
+⇒ **`RandomSampler` 跑在 7808 行上，不是 7809。** 直接对 7809 行重放会整体错位。
+正确的复盘配方（已存 `/personal/verl/opd_7809_seed42_plan.json`，含前 3 步的 row/task/题面哈希）：
+
+```python
+df = pd.read_parquet('train.parquet').drop(index=530).reset_index(drop=True)   # 7808
+g = torch.Generator(); g.manual_seed(42)
+order = list(iter(RandomSampler(data_source=range(len(df)), generator=g)))
+step_k_rows = order[(k-1)*batch : k*batch]        # k 从 1 开始
+```
+
+（`drop_last=True`，`ray_trainer.py:405-409` ⇒ `steps/epoch = floor(7808/32) = 244`。
+验证 loader 是 `drop_last=False`，`:418-423`。）
+
+### 题库盘点：`coding-practice-rl:7` 就是那个 7809 题的库（2026-09-14）
+
+不要再新建/上传题库。`wenyon-cli dataset list` **没有搜索/过滤 flag**（只有 `--include-hidden`），
+找版本号走 `trisol dataset get coding-practice-rl`（submit 的 help 就是这么建议的）。
+`trisol train list -o json` 会返回**全 team** 最近 50 个任务（含别人的），不适合定位数据集。
+
+| split | 行数 |
+|---|---|
+| train | **7809** |
+| validation | 976 |
+| test | 977 |
+
+已实测：三个 split 按 NFC 归一化题面哈希**两两无交集**；800 题那个卡是 train 的**真子集**；
+system prompt 与 800 卡**逐字节相同**；`extra_info` / `tools_kwargs` 格式一致；
+**`images.json` 存在**（注意 `coding-practice-rl-public` 那个变体**没有** images）。
+
+⇒ 想测泛化用 `validation`(976) 或 `test`(977)，它们与训练集结构上不相交。
+
+### ★★ 沙盒配额是**按轨迹**持有的，batch 必须远大于配额数才填得满尾巴（2026-09-14 实测 2.05×）
+
+`verl_coding/coding_sandbox_tool.py:229` 的 `while not await quota.try_acquire.remote(instance_id): await asyncio.sleep(5)`
+在**沙盒 create 时**拿许可，只在 `calc_reward`/`cleanup` 里释放 —— docstring 明说每次工具执行后的
+`release()` 是 no-op。⇒ **一条轨迹全程占一个许可，不是一次工具调用占一个。**
+
+TaskCreate loop 自己**没有**并发上限：`AgentLoopWorkerTQ.generate_sequences` 对每个样本
+`asyncio.create_task` 后 fire-and-forget，`prompts.chunk(len(self.agent_loop_workers))` 是静态
+round-robin、那一层没有 work stealing —— **沙盒许可是唯一的闸，而它是 work-conserving 的。**
+
+⇒ `MAX_CONCURRENT_SANDBOXES=32` 配 `train_batch_size=32` 时**零排队**，
+`timing_s/gen` 就退化成"最慢那一条轨迹的墙上时间"。prod 实测
+`response_length max/mean = 71880/24239 = 2.97` ⇒ 有近 3 倍的尾巴在空转。
+
+把 batch 抬到 128（4× 工作量）实测：
+
+| | bs32 | **bs128** |
+|---|---|---|
+| `timing_s/step` | — | 2.04× |
+| **每条轨迹墙上时间** | 105.0 s | **51.1 s（2.05× 吞吐）** |
+| 61 步预计 | 9.5 d | **4.62 d** |
+
+**保持优化过程不变的关键是 `PPO_MINI_BATCH_SIZE` 不动**（`ray_trainer.py:1316,1346` 会把它
+乘上 `rollout.n`）：bs32/mini16 = 244 步 × 2 = **488 次 16 条轨迹的更新**；
+bs128/mini16 = 61 × 8 = **488 次 16 条轨迹的更新**，逐项相同，只是步内 staleness 更大。
+（bs128/mini64 只有 122 次更新，**不要**这么配。）
+
+OPD 下步内 staleness **只是分布漂移，不是梯度偏差**：`losses.py` 的有效目标是逐 token
+`KL(student‖teacher)`，**没有 importance ratio**（`use_policy_gradient=True` 时 `ppo_loss` 算了
+但被 `policy_loss = 0.0` 丢掉）。
+
+**TQ 路径不产出 `agent_loop/*` 指标** —— `_performance_metrics`（`agent_loop.py:1236-1268`）
+里的 `agent_loop/generate_sequences/{min,max,mean}` 只在非 TQ 路径可达。
+枚举了全部 91 个 metric key，没有任何 `agent_loop/*`，**单条轨迹墙上时间在我们的日志里量不到**，
+只能用 `timing_s/gen ÷ batch` 反推。
+
+### `--since` 必须从 `created_at` 原样抄 UTC，写成本地时间会静默返回空日志（2026-09-14）
+
+我把本地时间当 UTC 填了 `--history --since 2026-09-14T11:30:00Z`，而 pod 的真实
+`created_at` 是 `2026-09-14T04:40:23.051Z` ⇒ `--since` 落在**未来**，
+`trisol train logs` **返回空且不报错**，我据此以为 trainer 卡在初始化，白等了 10 分钟。
+
+⇒ `--since` 永远从 `trisol train get <job> -o json` 的 `created_at` 逐字复制，不要自己算。
+
+### trisol 子命令的两个名字坑
+
+- 推理服务是 **`trisol inference`**，没有 `trisol serve`（`unknown command "serve"`，
+  再 pipe 给 `python -m json.tool` 会叠一个 JSON decode traceback，看起来像别的问题）。
+- **`trisol train cancel` 是 `train stop` 的废弃别名，没有 `--yes`**。
+  非交互要用 `trisol train stop <job> --team <t> --no-input`。
+
+### checkpoint download 不续传，`.partial` 会从头重下（2026-09-15）
+
+19.5 GB 的 checkpoint 下到 558 MB 时进程被回收（上个 session 的后台 bash 随 session 一起死），
+重跑 `trisol train checkpoint download` 时 4 个 `model_world_size_8_rank_*.pt.partial`
+**从 0 重新开始**，之前的字节作废。`extra_state_*` / `huggingface/` 那些小文件会被正确
+`skipped (already complete)`，但大分片不行。
+
+⇒ **长下载一律 `nohup ... &` 起，不要用工具的 `run_in_background`**（后者绑 session）。
+实测速率 ~11.8 MB/s（4 分片并发），19.5 GB 约 **26 分钟**；完成时 stdout 有
+`Downloaded 17, skipped 15 (already complete), failed 0`。
+
+### ★★★ OPD 训练量曲线读完了：step10/20/30/40 **四点全部持平**（2026-09-16）
+
+`opd-27b-7809-bs128n1-0914`（bs128 × n=1 / 7809 题 / `++data.seed=42`）的 step20、step30
+checkpoint 各起一个评测服务跑完 800 题，与已有的 step10、`opd-teacher27b-prod-0911` 的 step40
+并到 **789 道六方公共集**（同 harness：`batch_run_trisol.py -c 16`、`agent_trisol.py`、
+单跑一次、截断默认开 8000/3000/5000、`eval.correct is True` 为正确、`None` 计 FAIL）：
+
+| | 正确 | 率 | 轨迹 / 优化更新 |
+|---|---|---|---|
+| SFT-merged | 283/789 | **0.3587** | — |
+| OPD step40（bs8×n4） | 233/789 | 0.2953 | 1280 / 80 |
+| **OPD step30（bs128×n1）** | **226/789** | **0.2864** | 3840 / 240 |
+| OPD step10（bs128×n1） | 216/789 | 0.2738 | 1280 / 80 |
+| OPD step20（bs128×n1） | 209/789 | 0.2649 | 2560 / 160 |
+| 基模 | 185/789 | 0.2345 | — |
+
+| 对比 | Δ | 95%CI | p |
+|---|---|---|---|
+| step30 vs 基模 | **+0.0520** | [+0.021,+0.084] | **0.0016** |
+| step20 vs 基模 | +0.0304 | [+0.002,+0.059] | 0.048 |
+| **step30 vs step20** | **+0.0215** | [−0.007,+0.050] | **0.159** |
+| **step30 vs step10** | **+0.0127** | [−0.015,+0.040] | **0.419** |
+| **step20 vs step10** | **−0.0089** | [−0.036,+0.019] | **0.589** |
+| step30 vs step40 | −0.0089 | [−0.038,+0.020] | 0.611 |
+| step30 vs merged | −0.0722 | [−0.102,−0.043] | 2.5e-06 |
+
+**⇒ 训练量从 1280 涨到 3840 轨迹（3×）、更新次数 80→240，评测纹丝不动。**
+三点 0.2738 / 0.2649 / 0.2864 **非单调**，摆幅全在 results.md 记的噪声地板
+（同模型重跑漂 ±1pp、逐题 14% 翻转）附近。`step30 vs step40` p=0.611 ⇒
+**3 倍训练量仍追不上等预算的 step40。**
+
+**这与两个独立口径吻合，是同一幅图像的三个侧面：**
+1. **训练侧 `critic/score/mean`**（`ROLLOUT_N=1` 不放回 ⇒ 每步一次免费留出集读数）：
+   1-10 = 0.1930、11-20 = 0.1953（持平，与 `step20 vs step10` 的 p=0.589 对上）、
+   21-30 = 0.2328、**31-37 = 0.2333（抬头停在 21-30 那一档）**。
+   全程线性趋势 +0.00156/step **t=+2.89（n=37）** 已越过 t=2.5，但**下游读不出**
+   （`step30 vs step20` p=0.159）⇒ 训练侧这条趋势线目前**没有任何下游证据支持它对应能力提升**。
+   斜率随步数缓慢变小（27 步 +0.00176 → 30 步 +0.00167 → 37 步 +0.00156）⇒
+   涨的是统计功效不是效应量。
+2. **`ΔW/W`**：0.103%(st10) → 0.139%(st20) → 只 1.348×，`cos(增量, 累积)=0.136` 近正交
+   ⇒ 净位移按 √t 增长。见 [[opd-delta-w-near-orthogonal]]。
+
+**⇒ 不要再靠"多跑步数"救 OPD。** 该动的是教师（27B → qwen3.8 系列，
+外部 teacher 通道已实现并实测通过）或算法，不是训练量。
+
+**口径自校验必须在读新数之前做**（这次也做了）：同一脚本在 789 集上重算
+`merged vs base = +0.1242 / p=2.633e-14`、`step40 vs base = +0.0608 / p=1.098e-4`、
+`step10 vs base = +0.0393 / p=0.008008`，与本文件历史记录**逐位吻合**。
+
+`model` 字段全对（800/800 `opd-bs128-step20`、800/800 `opd-bs128-step30`）。
+step30 的 `eval.correct`：None 490（61%）/ True 226 / False 83；800 题 0 硬失败，耗时 37672 s。
+
+**★ 两个查完整性的假信号（都在这轮踩到）：**
+- **`grep -c 'rc=1'` 假阳性** —— 命中的是模型输出里的科学计数法
+  （`rc=1.000000e+00`、`rc=1.573882e-247`）。因为 `batch_run_trisol.py` 的
+  `subprocess.run(..., text=True)` 不捕获子进程输出，整个 agent transcript 落进父进程的
+  重定向文件（本次 GB 量级）。找硬失败要 `grep -aoE '\] (FAIL|OK).{0,120}'` 再筛，
+  或直接比"输出文件数 == 800"。
+- **`ls *.json | grep -v summary` 会误伤题目** —— 有道题名里带 `summary`
+  （`squidpy_..._extracting_summary_texture_..._10.json`），于是数出 799 让我以为死了 1 题。
+  数输出文件要用 `p.name.startswith('_') or p.name == 'summary_trisol.json'` 精确排除，
+  并与 `base.glob("*/raw/*/*/generator_output.json")` 算出的题名集合做差集定位缺题。
+
+### ★ `trisol model upload` 打印的是**版本 id**，不是模型 id（2026-09-16）
+
+upload 末尾那个裸数字是 `versions[].id`。把它填进推理服务 spec 的 `adapters[].model_id`，
+部署会在 model preparation 阶段失败：
+
+```
+status_message = Model preparation failed after 3 attempts: ...
+  resolve adapter "<key>" prefix: model adapter: version v1 for model <版本id> not found
+```
+
+平台按 `model_id + version_code` 解析。**模型本身是好的**（`trisol model get` 里
+`status: ready`、文件数/大小都对），不要重传，改 spec 重建服务即可。
+
+```bash
+trisol model get <name> --team infra-spot -o json
+# 顶层 id        = 模型 id      <- adapters[].model_id 填这个
+# versions[].id  = 版本 id      <- upload 打印的，不要填
+```
+
+判据：spec 里的 `model_id` 必须出现在 `trisol model list` 的 id 列里。
+（`trisol inference delete` 需要 `--yes`，`-y` 不是它的 shorthand。）
+
+### 起评测服务照抄老 spec：`inference revision` + `--from-file`（2026-09-15）
+
+`trisol inference get` **不返回** runtime spec（只有状态和 endpoint），要拿完整启动参数得用
+**`trisol inference revision <service_id> <revision>`**，`spec.runtime.args` / `spec.adapters` 都在里面。
+
+克隆一个只换 adapter 的评测服务：
+
+```python
+spec = json.load(open('rev40.json'))['spec']
+i = spec['runtime']['args'].index('--lora-modules')
+spec['runtime']['args'][i+1] = f'{KEY}=/mnt/adapters/{KEY}'
+spec['adapters'] = [{'model_id': NEW_MODEL_ID, 'version_code': 1, 'key': KEY}]
+for k in ['cpu','memory','shm_size','ephemeral_storage']:
+    spec['resources'].pop(k)          # --from-file: GPU 服务不得设置平台托管字段
+```
+
+```bash
+trisol inference create --name <svc> --team infra-spot --cluster w1 \
+  --model qwen3-5-9b:1 --from-file spec.json -o json --no-input
+```
+
+**改完必须 diff 一遍**（归一化掉那 4 个 pop 的字段后应当只差 adapter 那 3 行），
+不要靠眼看。起来约 **5 分钟**（`preparing` 预热 → `launching` → `running 4/4`）。
+
+**冒烟测试只看 `model` 字段回显，不要看 `content`**：带 `--reasoning-parser qwen3` 时
+正文进 `reasoning_content`，`max_tokens=20` 下 `content` 是 `None`，那不是失败。
+要验的是响应里 `"model": "<你的 lora key>"` —— 这一条挡住"请求打到基模"那个历史坑。
+
+### 评测产物在 `/personal/sp2/qwen_trajs/cc_deepseek_1w/`，不在 `/personal/verl`
+
+`trajectories_*/` 全在前者。我在 `/personal/verl` 下搜不到就以为评测没在跑，
+差点把还在被依赖的推理服务停掉（用户纠正）。**拆共享基础设施前先定位依赖它的活。**
+
+`batch_run_trisol.py` 的题目发现是 `base.glob("*/raw/*/*/generator_output.json")`，
+**`pathlib.glob` 跟随符号链接**，而 `train_sampled` 的 800 个叶子全是指向 `train/` 的 symlink
+⇒ `find` **不带 `-L` 会数成 0**，看起来像"题目没了"。数题用 `python3 -c` 跑同一个 glob。
+
+### ★ 800 题三方评测：OPD 显著赢基模，但显著输给 teacher SFT（2026-09-14）
+
+789 道公共题（三方都有输出），harness 一致（`batch_run_trisol.py -c 16`、`agent_trisol.py`、
+单跑一次、`eval.correct is True` 为正确、`None` 计 FAIL）：
+
+| | 正确 | 率 |
+|---|---|---|
+| SFT-merged `qwen-9b-sft-merged-qwen35-64k-r32` | 283/789 | **0.3587** |
+| OPD step40 | 233/789 | **0.2953** |
+| 基模 `qwen3-5-9b` | 185/789 | **0.2345** |
+
+- **OPD vs 基模**：Δ=**+0.0608**，配对 134/99/51/505，McNemar 精确双侧 **p=1.098e-4**，
+  CI [+0.0304,+0.0913]，翻转 19.0% ⇒ 比之前 266 子集那个 `+0.1015 / p=0.0116` **证据更强**。
+- **OPD vs SFT-merged**：Δ=**−0.0634**，189/44/94/462，**p=2.504e-5**，CI [−0.0926,−0.0342]
+  ⇒ **显著输给 teacher SFT**（+0.061 vs +0.124，差 2×）。
+- **自校验**：同一脚本重算 SFT-merged vs 基模得 Δ=+0.1242 / p=2.633e-14，与本文件早先记的
+  +0.1237 吻合 ⇒ 打分管线可信。**这一步要在读新结果之前做。**
+- OPD 缺的那 11 题（`--max-model-len 262144` 撞顶 → API 400 → 重试 3 次 → rc=1 不写文件）：
+  基模 0/11、merged 1/11。OPD/800 的上下界 0.2913–0.3050 都夹在基模 0.2313 与 merged 0.3550
+  之间 ⇒ 结论不变。
+
+**推断（不是实测）**：OPD 教师是 Qwen3.5-27B（train_sampled 上 50.7%/55.9%），
+merged-SFT 的教师是 qwen3.7-plus（67.1%）。**"方法弱"还是"教师弱"要靠换教师实验才能分开**，
+不要用这一轮去否定 OPD。
+
+---
+
+# 换 teacher：qwen3.8 系列核实 + 外部 teacher 通道（2026-09-15）
+
+> 动机：800 题三方评测显示 OPD 输给 teacher SFT，而两者教师不同（27B vs qwen3.7-plus），
+> 「方法弱 vs 教师弱」要靠换教师区分。候选是 qwen3.8-27B / qwen3.8-flash-next。
+
+## 模型清单（实测，都是真权重不是 API）
+
+| trisol 名 | model_id | 体积 | `architectures` / `model_type` |
+|---|---|---|---|
+| `qwen3-8-27b` | 2088292879372922880 | 51.8 GiB | `Qwen3_5ForConditionalGeneration` / `qwen3_5` |
+| `qwen3-8-flash-next` | 2092684765470666752 | **335.3 GiB** | `Qwen4ExpForConditionalGeneration` / **`qwen4_exp`**（176B 总 / 6B 激活，262K ctx） |
+
+## ★ tokenizer gate 通过 —— k1 换 teacher 的前置条件成立（实测）
+
+k1 把 student 的 `sequence_ids` **原样**喂给 teacher（`teacher_manager.py` 末尾
+`assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)`），
+所以 teacher 和 student **必须同 tokenizer**。逐项核对 vs Qwen3.5-9B：
+
+- `vocab.json`、`merges.txt` **md5 完全相同**
+- `tokenizer.json` 只多 7 个 audio/tts special token（248070–248076），全在 `vocab_size=248320` 内
+- 三个模型 `len(tokenizer)` 都是 **248077**
+- 22 条真实文本（20 条数据集题面 + `Å` + tool-call XML + `<final_answer>`）编码
+  **逐字节相同，0 处不一致**
+
+⇒ 换 3.8 系列当 teacher **不需要**重新对齐 tokenizer。
+
+## ★★ 现有训练镜像装不进 3.8：flash-next 硬失败，27B 是**静默数值错误**（实测）
+
+`verl-coding*` 系列镜像里 vLLM 0.26 / transformers 5.14.1：
+
+- **flash-next**：`qwen4_exp` 未注册 ⇒ **直接崩**，一眼能看出来。
+- **qwen3.8-27B**：`model_type` 仍是 `qwen3_5` ⇒ **能加载**，但 config 里新增的
+  `output_gate_type: "swish"` **两边都不认**，硬编码走 sigmoid：
+  - `transformers/models/qwen3_5/modeling_qwen3_5.py:718` `attn_output = attn_output * torch.sigmoid(gate)`
+  - `vllm/model_executor/models/qwen3_next.py:398` 同一行
+
+  **不报错、不警告，只是算错。** 而且两个 repo 里都没有 remote-code `.py`，
+  `trust_remote_code` 救不了。
+
+⇒ **"架构名相同所以能加载"是错的推理**。换模型必须 diff config，逐个新字段确认代码认不认。
+
+## ★★ verl 为什么不原生支持训推分离（读代码定案）
+
+**verl 里有"分离"，但那个词不是你以为的意思。** `RolloutMode` 三档
+（`verl/workers/rollout/replica.py:54-67`），STANDALONE 的 docstring 逐字写着
+"separate GPU resource, **disaggregated architecture**"，但 `init_standalone()`（`:189`）做的是
+
+```python
+resource_pool_spec = {f"rollout_pool_teacher_{rank}{suffix}": [gpus_per_replica_node] * nnodes}
+```
+
+⇒ **新开一个 Ray resource pool**。分离的是 GPU，不是进程 / 集群 / 生命周期。
+
+**结构性原因是 student rollout 每步要同步权重**（`verl/workers/engine_workers.py:683`
+`async def update_weights(...)`，前 `sleep` 后 `wake_up`，配 `release_kv_cache`/`resume_kv_cache`）。
+这要求 verl 持有引擎进程句柄、能与它建 NCCL/IPC ⇒ **student 的 rollout 引擎结构上不能是外部服务。**
+
+**teacher 是搭便车被圈进来的。** `teacher_model.py` 的 `_initialize_llm_servers()` 直接复用
+`get_rollout_replica_class(...)` + `init_colocated(pool)` + `LLMServerClient` + 负载均衡器，
+`is_teacher_model=True` 只是同一个类上的一个 flag。于是 teacher **继承了 rollout 的全部约束，
+而它一条都不需要** —— 权重冻结，永远不 `update_weights`/`sleep`/`wake_up`。
+**这是复用的副作用，不是设计取舍。**
+
+次要原因（推断，有代码支撑）：verl 要 token-in/token-out（`prompt_ids` 直接进、
+`prompt_logprobs` 直接出，不走 tokenizer 往返），而它要同时支持 vLLM/sglang/trtllm 三家
+（`replica.py:321-383`），三家 HTTP 层对"token id 数组当 prompt"+`prompt_logprobs` 的支持不统一；
+另外 `LLMServerClient` 还做 least-in-flight 负载均衡 + sticky session（为 prefix caching），
+需要引擎注册表，外部服务只给 URL 拿不到。
+
+**⇒ 接外部 teacher 的注入点只有一个**：`MultiTeacherModelManager.get_client()` 返回的那个 dict。
+换成 HTTP 版 client，只需实现 `generate(request_id, prompt_ids, sampling_params)`
+一个方法、返回带 `extra_fields["prompt_logprobs"]` 的 `TokenOutput`。
+teacher 接口窄得出奇（`teacher_manager.py:34-141`）：
+`sampling_params = {"max_tokens": 1, "temperature": 1.0, "prompt_logprobs": num_logprobs}`，
+k1 路径**不用** `teacher_ids`（只有 topk 路径用）。
+
+**真正的收益不是省卡，是把 teacher 的 vLLM 版本与 student rollout 的 vLLM 版本解开** ——
+现在它们被迫共用一个镜像，这正是 qwen3.8 装不进来的根因。
+
+## 外部 teacher 通道实测可行
+
+vLLM `/v1/completions` 接受 **token id 数组**当 prompt
+（`vllm/entrypoints/openai/completion/protocol.py:94` `prompt_logprobs: int | None = None`；
+注意 vLLM 0.26 起 `vllm.entrypoints.openai.protocol` 这个模块**已不存在**，挪到了
+`completion/protocol.py`）。对两个在跑的 trisol 服务实测 POST
+`{"prompt": [ids...], "max_tokens": 1, "prompt_logprobs": 0}`：
+
+返回的 `prompt_logprobs` 与输入位置 **1:1 对齐**（首元素 null，每个 dict 以该位置的 token id 为键）
+—— 正是 verl 消费的语义。吞吐（4000 token）：27B **4265 tok/s**、flash-next **8551 tok/s**。
+折算 prod（128 traj × ~24239 tok ≈ 3.1M tok/step）⇒ 27B 四副本约 **3 min/step**，
+远低于 `timing_s/gen` 的 2000 秒量级 ⇒ **teacher 不会成为瓶颈。**
+
+**坑**：`prompt_token_ids` 有时返回 `null`，拿它和输入比会得到假的 `ids_match=False`
+（200 token 时直接 `TypeError: object of type 'NoneType' has no len()`）。
+k1 不用 `teacher_ids`，且我们本来就知道发出去的 ids，**不必比**。
+
+## ★★ `prompt_logprobs` 的显存公式：0.947 MiB/token，且只由 chunk 决定
+
+`_get_prompt_logprobs_dict` → `sampler.compute_logprobs(logits)` →
+`logits.log_softmax(dim=-1, dtype=torch.float32)`，**按每个被调度的 prefill chunk** 执行：
+
+```
+峰值 = max_num_batched_tokens × vocab × 4 B
+```
+
+Qwen 词表 248320 ⇒ **0.9473 MiB / token**。与历史 OOM 记录**逐位吻合**：
+报 `Tried to allocate 7.33 GiB`，7.33 GiB ÷ 0.9473 MiB = **7923 token** = 当时的 chunk 大小。
+
+⇒ **10 万 token 的 prompt 不比 4 千 token 的更费显存**，只是 chunk 数多。
+**长轨迹本身不是障碍，chunk 才是唯一杠杆**（调 TP 没用，vLLM 是 all-gather 完 logits 再 softmax）。
+
+| `max_num_batched_tokens` | fp32 buffer |
+|---|---|
+| 8192（vLLM 默认量级） | **7.58 GiB** |
+| 4096 | 3.79 GiB |
+| **2048** | **1.89 GiB** |
+| 1024 | 0.95 GiB |
+
+（`log_softmax` 的输入 bf16 logits 同形状还要 0.47 MiB/token；历史 OOM 报的是 fp32 那次分配，
+上表按 fp32 口径，真实峰值可能再高 50%，**这一项没实测**。）
+
+**8 卡 flash-next 评测服务实测占用 77037/81920 MiB ⇒ 只剩 4.77 GiB**，
+而它的启动参数里**没有** `--max-num-batched-tokens`（走默认）⇒ 默认 chunk 装不下。
+KV cache 完全不是约束（`/metrics` 实测 `kv_cache_size_tokens=2040781`、
+`kv_cache_max_concurrency=7.78`、使用率 **1.68%**，一条 10 万 token 轨迹只占 4.9%）。
+
+**不要在正在评测的服务上试** ——`prompt_logprobs` 触发 OOM 在 vLLM V1 里会打死 engine core，
+整个服务挂掉，评测全废。要跑 teacher 就另起专用服务：
+`--max-num-batched-tokens 2048` + `--gpu-memory-utilization 0.85`。
+
+## ★ 起 flash-next 服务：镜像 5 分钟 + 权重 25 分钟，**但早期 ETA 会骗你 14 倍**（实测）
+
+`qwen38-flashnext-teacher`（2099737790336995328，TP=8 / A100×8 / vLLM 0.29.0）：
+
+```
+Pulled image ... in 5m7.205s   Image size: 8674227544 bytes
+Filesystem type for checkpoints: NFS. Checkpoint size: 335.28 GiB. Available RAM: 1493.90 GiB.
+Loading safetensors checkpoint shards:   3% | 4/131 [14:18<6:19:53, 179.47s/it]   <- 报 6 小时
+Loading safetensors checkpoint shards: 100% | 131/131 [25:35<00:00,  1.57it/s]    <- 实际 25m35s
+```
+
+**⚠️ tqdm 的 ETA 在前几个 shard 上高估了 14 倍。** 机制：各 worker 先
+`Prefetching checkpoint files into page cache`（`weight_utils.py:825`，8 线程后台），
+**头几个 shard 要等 NFS 冷读**（288s、365s、199s、179s/it），prefetch 一旦追上就变成
+**1.57 it/s**。⇒ **不要用早期 ETA 排期**，它测的是冷缓存不是稳态。
+从 pod Created 到 `status=running` 端到端 **约 31 分钟**（含镜像 5m7s）。
+
+期间 `status` 一直停在 `deploying | Waiting for pods to become ready`、
+`/health` 的 startup probe 一直 refused —— **看起来像卡住，其实在正常加载**。
+判据去 `trisol inference logs <id> --tail 400 | grep "Loading safetensors"` 看
+**shard 计数在不在动**，不要看 ETA、也不要凭 status 判死活。
+
+## ★★★ 专用 teacher 服务实测：`prompt_logprobs` 在 114688 token 上通过，**长度不是障碍**
+
+`qwen38-flashnext-teacher`（2099737790336995328）= 从评测服务 revision 克隆 + 5 处改动：
+`--max-num-batched-tokens 2048`（新增）、`--gpu-memory-utilization 0.9→0.85`、
+`--max-model-len 262144→131072`、去掉 4 个 parser flag（teacher 不生成内容）、换
+`--served-model-name`（冒烟时靠 `model` 字段回显挡住"打到基模"那个历史坑）。
+**改完用归一化 diff 核对**（pop 掉 4 个平台托管字段后应当只差这 5 处），不要眼看。
+
+**单条递增长度**（`max_tokens=1, prompt_logprobs=0`，token-id 数组当 prompt）：
+
+| T | 耗时 | tok/s | `len(prompt_logprobs)==T` |
+|---|---|---|---|
+| 2048 | 2.5 s | 830（首请求含 warmup） | ✓ |
+| 8192 | 0.8 s | 9851 | ✓ |
+| 32768 | 3.4 s | 9534 | ✓ |
+| **114688** | **12.7 s** | **9056** | **✓** |
+
+**⇒「峰值只由 chunk 决定、与 prompt 长度无关」这个推断被证实。** T=114688 是 T=2048 的
+56 倍长度，chunk 相同 ⇒ 不但没 OOM，吞吐只降 8%。**OPD 的长轨迹对 teacher 不构成显存障碍。**
+
+**并发压测**（每条 114688 token，首 token 加 salt 破坏 prefix caching）：
+
+| 并发 | 成功 | 墙上时间 | 总吞吐 | 单条延迟 min/med/max |
+|---|---|---|---|---|
+| 4 | 4/4 | 44.3 s | 10363 tok/s | 13.0 / 33.7 / 44.2 s |
+| 8 | 8/8 | 86.2 s | 10650 tok/s | 12.9 / 54.6 / 86.0 s |
+| 16 | 16/16 | 170.1 s | 10788 tok/s | 12.8 / 96.2 / 169.7 s |
+
+**0 失败。吞吐饱和在 ~10700 tok/s，与并发数无关；延迟随并发线性增长**
+⇒ 已达算力上限，多余请求在 vLLM scheduler 里按 KV 排队（**不是** OOM 风险）。
+实测 `kv_cache_size_tokens=1706658`、`kv_cache_max_concurrency=13.02`，
+一条 114688 的轨迹占 KV 的 6.7% ⇒ 16 条并发（1.83M token）超出容量，排队是预期且安全的。
+
+显存在压测前后**都是 73029/81920 MiB**（util 0.85 比 0.9 正好少占 4096 MiB，对得上）,
+余量 8.68 GiB ≫ 2048-chunk 所需的 1.89 GiB。
+
+**折算 prod**（bs128 × ~24239 tok ≈ 3.1M tok/step）：teacher 侧 ≈ **4.8 min/step**，
+而 bs128 的 `timing_s/step` 是 4600 s 量级 ⇒ **teacher 占约 6%，不是瓶颈**（与 27B 的估计一致）。
+
+## ★★ 外部 teacher client 已实现并实测通过（2026-09-15）
+
+代码已在仓库，**`AsyncTeacherLLMServerManager` 一行未改** —— 新 client 同时复刻
+`LLMServerClient.generate` 的签名和 `extract_prompt_logprobs` 的输出形状，消费方分辨不出两条路。
+
+| 文件 | 改动 |
+|---|---|
+| `verl/experimental/teacher_loop/external_teacher_client.py` | **新增**：`shape_prompt_logprobs()` + `ExternalTeacherClient` + `ExternalTeacherRequestError` |
+| `verl/workers/config/distillation.py` | 新增 `DistillationExternalTeacherConfig`、`all_teachers_external()`、`is_external`、`world_size` 外部时返回 **0** |
+| `verl/trainer/config/distillation/distillation.yaml` | `teacher_models.teacher_model.external` 段 |
+| `verl/experimental/teacher_loop/teacher_model.py` | 外部 teacher 早退（不起 engine、不建 load balancer）、只对本地 teacher 切池、`get_client()` 分派 |
+| `verl/trainer/ppo/v1/trainer_base.py` | `all_teachers_external` 时跳过 `teacher_pool` 与 `Role.TeacherModel` 映射；取池处改成 `None` |
+| `verl/trainer/main_ppo_v0.py` | 同上（legacy v0 路径的两处门） |
+
+开启方式（`nnodes=0`，teacher **0 卡**）：
+
+```bash
+distillation.enabled=true distillation.nnodes=0 \
+distillation.distillation_loss.loss_mode=k1 \
+distillation.distillation_loss.use_policy_gradient=True \
+distillation.distillation_loss.use_task_rewards=False \
+distillation.teacher_models.teacher_model.external.base_url=https://xxx.inference.trisol.dp.tech \
+distillation.teacher_models.teacher_model.external.model_name=<served-model-name>
+```
+
+`api_key` 走 `external.api_key_env`（默认 `TEACHER_API_KEY`）读环境变量，不要写进 config。
+
+### ★ 零 GPU 是靠 `world_size` 返回 0 表达的，不要去改那个求和判据
+
+`DistillationConfig.__post_init__` 的 `Σ(num_replicas × per_replica_world_size) == n_gpus_per_node × nnodes`
+**一个字都不用改**：外部 teacher 的 `world_size` 恒为 0，`nnodes=0` 时右边也是 0。
+反过来，外部 teacher 配 `nnodes>0` 会被显式拦下（要 GPU 却不用 GPU 是配置错误）。
+
+另一处必须动的是 `ResourcePoolManager.get_resource_pool(Role.TeacherModel)` ——
+它是 `resource_pool_dict[self.mapping[role]]`，**角色没映射就 KeyError**，
+所以调用点要先查 `Role.TeacherModel in ...mapping`。
+
+### ★★ k1 也必须返回 `prompt_ids`，尽管它不用
+
+我原本打算 `extra_fields` 只放 `prompt_logprobs`。**错了**：
+`teacher_manager.py:138-140` 无条件 `torch.tensor(extra_fields["prompt_ids"])` 并 assert
+`teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)`。
+k1 不**使用** ids 的语义，但张量照建、形状照断言 ⇒ 两个数组都得给，长度都是 S。
+
+形状规则（照 `vllm_rollout/utils.py:484-517` 逐条复刻）：跳过 index 0（首 token 无条件 logprob）、
+`k==0` 取字典里唯一那项、`k>0` 按 `rank-1` 落位且丢掉 `rank>k`、最后**补一行 dummy**
+（`[0]*max(k,1)` / `[0.0]*max(k,1)`）。⇒ 位置 `i` 存的是 token `i+1` 的 logprob。
+
+**离线等价性已逐位验证**：随机构造 vLLM 对象版与 JSON 版同源输入，
+`(S,k) ∈ {(1,0),(2,0),(17,0),(1,32),(5,32),(9,1)}` 六组全部 `match=True`（含 S=1 只有 dummy 行的边界）。
+
+### 实测：对 `qwen38-flashnext-v029`（老评测服务）短 prompt 全通过
+
+127 token，`Authorization: Bearer` 走环境变量：
+
+| k | 结果 |
+|---|---|
+| **0**（k1 路径） | shape 127×1，**next-token 对齐 True**（`pid[i][0] == ids[i+1]` 全中），per-token NLL **0.8679** |
+| **20** | shape 127×20，按 rank 单调 True，无 `None` 落位，next token 落在 top-20 的 124/126 |
+| 32 | **HTTP 400**：`Requested prompt logprobs of 32, which is greater than max allowed: 20` |
+
+**⇒ 老评测服务没带 `--max-logprobs`，默认上限 20。** 这是服务端启动参数，不是 client 问题；
+但 topk 类 loss（`forward_kl_topk` 默认 topk=32/128）走外部 teacher 时**必须起服务时就配 `--max-logprobs`**，
+否则每个请求 400。k1 用 `prompt_logprobs=0`，不受这条限制。
+
+并发 8 条 / `max_concurrency=4` 的信号量：形状全对，wall 0.2s。
+
+**`qwen38-27b-eval-tp2`(2099319421876056064) 已 `stopped`** ⇒ 打它的 endpoint 返回 **404 空 body**，
+不是 client bug。测外部 teacher 前先 `trisol inference get <id> -o json` 看 `status`。
+
+### 4xx 不重试的判据要用异常字段，不要 substring 匹配
+
+第一版写的是 `if isinstance(e, RuntimeError) and "HTTP 4" in str(e): raise` ——
+而那条消息的尾部**嵌着服务器返回的 body**，body 里恰好出现 `HTTP 4` 的 5xx 就会被当成 4xx 跳过重试。
+改成 `ExternalTeacherRequestError` 带 `status` 字段，判 `400 <= e.status < 500`。
+
+实测：4xx **0.03s** 抛出（`max_retries=3, retry_backoff_s=5.0` 下若重试会是 35s+）；
+传输错误（不可路由 host）3 次尝试、backoff 0.1→0.2、总 0.30s 后抛 —— 两条路径都按设计走。
+
+三处防御性报错是故意的：
+- **返回的 `prompt_logprobs` 条数 ≠ `len(prompt_ids)`** ⇒ 直接炸。这是 tokenizer 不一致 /
+  服务端截断的唯一信号，放过去就是**静默污染蒸馏目标**。
+- 缺 `prompt_logprobs` 字段 ⇒ 服务端不支持（非 vLLM 类）。
+- 多模态输入 ⇒ 这条通道不支持，要用就 colocate。
+
+## trisol CLI 补充坑（本窗新踩）
+
+- `trisol model download <name>:<ver> a.json b.json -o <dir>` ⇒ `accepts between 1 and 3 arg(s)`。
+  单文件形态**只收一个** repo path，多文件只能循环。
+- 公共模型 `--model`/`download` 的**名字解析只在自己的模型里找** ⇒ `no model matching "..."`。
+  用数字 id + 废弃的三参形态：`trisol model download <id> <ver> <path> --output -`。
+  列表要 `trisol model list --public --search <kw> --all`。
+- `trisol model files <id>` ⇒ `accepts 2 arg(s)`，必须给 version：`trisol model files <id|name> <ver>`。
+  它的 `-o json` 是**裸 list**，不是 `{"items": [...]}`。
+- `trisol inference` 的诊断三件套：`pod-events`（K8s 事件，能看到镜像拉取耗时）、
+  `logs --tail N`（活体 pod 快照，`--history` 走 Loki）、`status`。
+  **`trisol inference get` 不返回 runtime spec**，要 `trisol inference revision <svc_id> <rev>`。
+- **heredoc `python3 - <<'EOF'` 的 stdout 再 pipe 给 `grep -v` 会吞掉退出码**，
+  静默失败两次（`Exit code 1` 且无输出）。用不同的定界符（`PYEOF`）并把 stderr
+  过 `grep -viE` 而不是 `2>/dev/null`。
+
+---
+
+# 工具输出长度与截断（2026-09-15，实测 + 已落地）
+
+## 结论先行：上下文超限只占评测失败的 **1.9%**，不是主因
+
+`trajectories_opd_bs128_step10`（800 题）全量统计，峰值上下文按**发出过的请求**算
+（= 每条 assistant 消息**之前**的累计上下文），换算用实测 chars/token：
+
+| 失败类型 | 数量 | 峰值上下文中位（tokens，估算） |
+|---|---|---|
+| 硬失败 `rc=1`（API 400 上下文超限） | **15/800** | > 262,144 |
+| `None`（撞 30 轮没交答案） | 490/785 | **28,942** = 上限的 **11%** |
+| `False`（交了但错） | 81/785 | 33,325 |
+| `True` | 214/785 | 21,328 |
+
+全体峰值中位 **27,492 tokens = 上限的 10.5%**，p95 110,666，只有 **5/785（0.6%）**
+超过上限的 80%。**主导失败模式（62% 的 `None`）离上限差 9 倍，与长度无关。**
+
+**★ 算峰值必须只算"真的发出去过"的请求。** 我第一版把"下一次请求"（撞 30 轮上限后
+根本没发）也累进去，于是有 3 条轨迹看起来超限——而它们明明有输出文件。
+**有输出文件 = 没超限，这是个免费的自检，算出矛盾就是口径错了。**
+
+## chars/token 必须实测，两类文本差 35%
+
+用 `/personal/Qwen/Qwen3.5-9B` 的 tokenizer 在 25 条轨迹上实测：
+
+| 文本 | chars/token |
+|---|---|
+| **工具返回**（密集/结构化） | **2.65** |
+| assistant | 3.58 |
+| sys + user | ~3.55 |
+
+上下文构成：工具 **49.1%** / assistant 46.1% / sys+user 4.7%。
+
+## 工具返回长度分布（n=18,904，47.0M 字符）
+
+p50 **462** / p75 1450 / p90 **5214** / p95 10803 / p99 25828 / p99.9 163522 /
+max **883,678** / mean 2488。⇒ **典型返回很短，长尾极重。**
+
+## ★ 长返回的 97% 是沙盒把命令**原样回显**，纯重复
+
+沙盒失败时返回 `[error] 执行命令失败: <逐字回显的命令> ... 返回码: N 标准输出: ... 标准错误: ...`。
+那段回显**已经在上下文里**（就是 assistant 那次 `tool_call` 的 arguments）⇒ 纯浪费。
+
+- 含 `返回码:` 的 3,862 条返回里，**标记之前**占全部工具字符的 **34.7%**，
+  标记之后只占 **6.8%**。
+- 其中长返回（>8000）：总长中位 13,811，`返回码:` **之后**的有用载荷中位只有 **460 字符**，
+  回显占比中位 **96.8%**。
+- 与前一条 assistant 命令**精确逐字匹配**的回显：2,185 条、7,883,187 字符 =
+  **全部工具字符的 16.8%**。
+
+## ★ 必须 head+tail，不能只留 head
+
+长的**非错误**返回（`ls -la` 列表、构建日志、`cat` 源码）答案在**尾部**。
+实例：一条 170,055 字符的 salmon index 日志，最后一行才是最终答案数组
+`[18946, 18902, 1.0024, 5.7409, 5.7408, True, False]`。只留 head 会把答案剪掉。
+
+## 阈值选 8000（head 3000 + tail 5000）
+
+| 阈值 T | 命中的返回 | 砍掉的工具字符 | 峰值 >80% 上限的轨迹 |
+|---|---|---|---|
+| 不截断 | — | — | 5 |
+| 32,000 | 0.71% | 18.4% | 1 |
+| 16,000 | 2.79% | 27.3% | 0 |
+| **8,000** | **7.02%** | **41.9%** | **0** |
+| 4,000 | 11.9% | 56.6% | 0 |
+
+p90=5,214 ⇒ **93% 的返回一个字不动**；砍掉 41.9% 工具字符 ≈ 20.6% 总上下文；
+把工具侧贡献封顶在 `30 × 8000 / 2.65 ≈ 90k` tokens。
+tail 给 5000 是因为 `返回码` / stderr / 最终答案都在尾部。
+
+## 相关≠因果：长返回轨迹的正确率低是难度混淆
+
+| | 有该长度以上的返回 | 没有 |
+|---|---|---|
+| >16,000 字符 | **14.3%** | **33.6%** |
+| >32,000 | 14.8% | 29.2% |
+| >64,000 | 14.9% | 28.0% |
+| >100,000 | 16.1% | 27.7% |
+
+**但控制轮数后就没了**：只看每条轨迹**前 10 条**工具返回，三个结果组的长度中位
+分别是 438 / 484 / 441，**几乎相同** ⇒ 是难题跑得久、返回更多更长，不是长返回导致做错。
+**不要拿上面那张表说"截断能涨点"。**
+
+## 落地：`agent_trisol.py` 的截断**默认开**（2026-09-15 起）
+
+`/personal/sp2/qwen_trajs/cc_deepseek_1w/agent_trisol.py` 原本**完全没有**工具输出截断。
+新增 `truncate_tool_output()` + 三个环境变量，**默认
+`TOOL_OUTPUT_MAX_CHARS=8000 / HEAD=3000 / TAIL=5000`，以后所有评测都开**。
+要复现历史（不截断）口径就显式设 `TOOL_OUTPUT_MAX_CHARS=0`。
+
+理由：开截断的目的**不是涨点，是消除"API 400 上下文超限 ⇒ rc=1 ⇒ 不写输出文件"这个
+硬失败模式**，让每道题至少能跑完。截断口径与不截断口径的结果**直接对比即可，
+把哪些题是哪个口径记清楚就行**（用户决策）。
+
+**记录约定**：目录里放一个标记文件说明混合口径，例如
+`trajectories_opd_bs128_step10/_TRUNCATED_RERUN.json`（列出补跑的 15 题）、
+`trajectories_opd_bs128_step20/_NO_TRUNCATION_PREFIX.json`（列出切换默认之前跑完的 61 题）。
+打分脚本要把这些 `_*.json` 和 `summary_trisol.json` 一起排除。
+
+**`_execute_tool` 有两个调用点，必须都改。** 打补丁时 `assert s.count(old) == 2` 再替换，
+漏一个就是一半的工具返回不截断，而且不报错。
+
+## ★★ 15 题 A/B：截断把硬失败全救活了，但**救不回正确率**（完美配对）
+
+同一个 step10 adapter、同一批 15 道**在不截断时 `rc=1` 全死**的题，只开截断重跑：
+
+| | 不截断 | **开截断（8000/3000/5000）** |
+|---|---|---|
+| 产出输出文件 | **0/15** | **15/15** |
+| `eval.correct is True` | — | **3/15（0.20）** |
+| `None`（撞 30 轮没交答案） | — | 12/15 |
+| 峰值上下文 max | > 262,144 | **94,027（上限的 35.9%）** |
+| 峰值上下文中位 | — | 23,027 |
+| 被截断的工具返回 | — | 36/397 = **9.1%**（预测 7.02%） |
+
+**⇒ 截断消除的是"死于上下文超限"这个失败模式，不是"做不对"。**
+3/15 = 0.20 落在 step10 全集 0.2745 的下方，与"这 15 道本来就是最难最长的题"一致。
+（预测 7.02% vs 实测 9.1%：这 15 题是长尾里最极端的，命中率高于全体，符合预期。）
+
+**这 15 条已按用户决策合并回 `trajectories_opd_bs128_step10/`（口径记在
+`_TRUNCATED_RERUN.json`），step10 从此是完整的 800 题。** 全量重算（789 四方公共集，
+自校验 `merged vs base = +0.1242 / p=2.633e-14`、`step40 vs base = +0.0608 / p=1.098e-4`
+与本文件历史记录逐位吻合）：
+
+| | 正确 | 率 |
+|---|---|---|
+| SFT-merged | 283/789 | 0.3587 |
+| OPD step40（bs8×n4） | 233/789 | 0.2953 |
+| **OPD step10（bs128×n1）** | **216/789** | **0.2738** |
+| 基模 | 185/789 | 0.2345 |
+
+| 对比 | Δ | 95%CI | p |
+|---|---|---|---|
+| step10 vs 基模 | **+0.0393** | [+0.011,+0.067] | **0.0080** |
+| **step10 vs step40** | **−0.0215** | [−0.049,+0.006] | **0.152** |
+| step10 vs SFT-merged | −0.0849 | [−0.114,−0.056] | 2.40e-08 |
+
+补齐 15 题后 step10 从 776 集的 0.2745 变成 789 集的 0.2738，**三条结论一个都没变**
+（尤其「等预算下 `ROLLOUT_N` 4→1 无差别」仍然是 p=0.152）。
+之前报的上下界 0.2675–0.2863 也被实测值坐实。
+
+~~**训练侧同样值得做**：`verl_coding/coding_sandbox_tool.py` 也没有截断，
+那 16.8% 的纯重复既吃 rollout 上下文也吃吞吐。（未做。）~~
+**⚠️ 这句作废** —— 工具本身确实不截，但截断在 agent loop 里，**训练侧一直在截，而且比评测严 4 倍**。见下节。
+
+## ★★ 训练侧早就在截，上限 2048/middle —— 不一致的方向与直觉相反（2026-09-16 实测）
+
+`run_coding_practice_qwen3_5_9b_4l20.sh:59` `max_tool_response_length=${MAX_TOOL_RESPONSE_LENGTH:-2048}`
+（→ `:160` 的 `actor_rollout_ref.rollout.multi_turn.max_tool_response_length`），
+`tool_response_truncate_side` 取默认 **`middle`**（`verl/workers/config/rollout.py:58`）⇒
+`tool_agent_loop.py:548-555` 做 `head 1024 + "...(truncated)..."(17) + tail 1024` = **2065 字符硬顶**。
+
+`rollout_data/nd267`（3840 轨迹 / 64170 条工具返回）实测，**p90/p95/p99/p999 全部恰好 2065**，
+2000–2099 桶里有 16431 条；工具返回只占 output 字符的 **20.9%**。
+⇒ **不要在 rollout 数据上统计"工具返回长度分布"当作真实分布**，它是被 2065 削平的。
+
+**⇒ 真正的口径不一致是 train 2048/middle vs eval 8000(3000+5000)，训练比评测严。**
+（评测侧 2026-09-15 起默认开 8000，见上节。）
+
+### 未截断的真分布与两个上限的代价（`trajectories_qwen9b_base_with_rc` 799 轨迹 / 19125 条返回，实测）
+
+原始 p50 409 / p75 1380 / p90 5049 / p95 9728 / p99 22270 / max 345761 / mean 2070。
+
+| 上限 | 命中返回 | 保留工具字符 | vs 2048 | 工具占上下文 |
+|---|---|---|---|---|
+| 不截断 | — | 39.6M | 2.78× | **52.4%** |
+| **2048（训练）** | **18.07%** | 14.25M | 1.000× | **28.4%** |
+| 3072 | 13.89% | 17.34M | 1.217× | 32.6% |
+| 4096 | 11.62% | 19.82M | 1.391× | 35.6% |
+| **8000（评测）** | **6.45%** | 26.35M | **1.850×** | **42.3%** |
+
+**2048-middle 丢的到底是什么（实测，按 `返回码:` 拆）：**
+
+| | n | p50 | >2048 | 2048<l≤8000 | >8000 |
+|---|---|---|---|---|---|
+| 错误返回（含 `返回码:`） | 4645 | 1064 | 39.3% | 21.7% | 17.7% |
+| 非错误返回 | 14480 | 245 | 11.2% | 8.4% | 2.9% |
+
+错误返回里 `返回码:` **之后**的有用载荷 p50=**327**、**81.6% ≤1024** ⇒ middle 模式的 tail 1024
+**把错误返回的关键信息基本全保住了**（这也是 middle 优于 left/right 的实证理由）。
+真正被"腰斩"的是长目录列表 / 构建日志 / `cat` 源码的**中段**；抬上限能新增信息的人群
+只有落在 **2048<l≤8000 的那 11.6%** 返回。
+
+### 没有任何测量支持"2048 伤了性能"（两个量，一个阴性一个混淆）
+
+- **重试代理（阴性）**：被截断后下一次 `tool_call` 与本次**逐字相同**的比例 **0.61%**（15700 次机会），
+  未截断是 **2.11%**（45518 次）⇒ 截断**没有**引起"重跑同一条命令"。
+  （混淆：长输出本来就是不该重复的命令。）
+- **每轨迹截断率 vs score（混淆，不可读成因果）**：按 tool 轮数分桶控制后失败组始终更高
+  （1–5 轮桶 0.340 vs 0.195；21–30 轮桶 0.242 vs 0.219）—— 与评测侧记的同一个难度混淆。
+
+### 抬上限的代价：换的是 response token 预算，不是"信号"
+
+**工具 token 不进 loss**（`tool_agent_loop.py:457` `response_mask += [0] * len(response_ids)`）⇒
+截断**不改变任何被训练的 token**，只改变条件上下文。所以这是吞吐 / 上下文预算 / 训评一致性问题。
+
+**但 masked 的 tool token 照样计入 `response_length`**（`:444` 的门是
+`len(agent_data.response_mask) + len(response_ids) >= self.response_length` ⇒ `TERMINATED`）
+⇒ **截断直接换的是轮数预算，撞上限的轨迹被砍断 = 几乎必然 score 0。**
+
+按 eval 侧聚合比缩放每条轨迹的工具字符 + 实测 chars/token（工具 2.65 / assistant 3.58）
+**估算**（**推断，不是实测**）nd267 的 response token：
+
+| 上限 | mean | p99 | ≥98304 | ≥80% 上限 |
+|---|---|---|---|---|
+| **2048** | 20630 | 82630 | 0.05% | 51 |
+| 4096 | 22758 | 86965 | 0.21% | 70 |
+| **8000** | **25250（+22%）** | 91276 | **0.42%（8×）** | 88 |
+
+`timing_s/gen` 占 step 的 80% ⇒ +22% response token 会直接体现在步时长上。
+
+**⇒ 结论：不要把 rollout 的上限抬到 8000。** (a) 新增信息集中在 11.6% 的返回，
+而错误返回的关键载荷 2048-middle 已经保住；(b) 代价是 +22% response token、
+撞 response 上限的轨迹 ×8、`gen` 同比涨；(c) 没有任何测量支持 2048 伤了性能。
+**"训练 2048 / 评测 8000"这个不一致要记着**，它是"训练侧 `critic/score/mean` 与评测侧准确率
+不可直接比"的一个候选来源（**未验证**）。
+
+### 小 bug：`Unknown function` 绕过截断
+
+`tool_agent_loop.py:504-506` 的 `Unknown function '<name>'. Available tools: [...]` 是
+**早 return**（`return ToolResponse(text=msg), 0.0, {}`），走不到 `:548` 的截断。
+模型把 XML 写坏时 `tool_name` 会吞掉整条命令 ⇒ nd267 里 16 条 >3000 字符的返回全是这个，
+最长 **15546** 字符。占 64170 条的 **0.025%**，不紧急，但它是"训练侧还有长返回"的唯一来路。
+
+## 复用 `discover_problems()` 的 skip 语义来选题（比加 CLI flag 省事）
+
+`batch_run_trisol.py:discover_problems()` 对 `{output_dir}/{name}.json` 做
+`Path.is_file()`，命中就 `Skip problem`。**`is_file()` 跟随符号链接** ⇒
+新建一个目录、把已有的 785 个输出 **symlink** 进去，runner 就恰好只跑缺的 15 题，
+而新产出的是**真文件**，`os.path.islink()` 一眼能和 symlink 分开。不用改脚本、不用传题目列表。
+
+**题名不要从日志里抄** —— 进度行把名字截断到 60 字符，拿它去 glob 会命中兄弟题目。
+要用 `base.glob("*/raw/*/*/generator_output.json")` + `name = 父目录名 + "_" + 目录名` 自己算。
