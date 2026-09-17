@@ -84,6 +84,34 @@ teacher_models:
     key: null
     model_path: null
     num_replicas: 0
+
+    # Optional teacher served outside the verl Ray cluster. Setting `base_url`
+    # switches this teacher to an HTTP client: verl launches no teacher engine,
+    # the teacher costs 0 GPUs in this job, and `model_path` / `inference` /
+    # `num_replicas` below are unused. Requires distillation.nnodes=0.
+    # The external teacher MUST share the student's tokenizer.
+    external:
+      _target_: verl.workers.config.DistillationExternalTeacherConfig
+
+      # Base URL of the OpenAI-compatible service; `/v1/completions` is appended.
+      base_url: null
+
+      # Must match the server's --served-model-name.
+      model_name: null
+
+      # Bearer token. Prefer api_key_env to keep secrets out of configs and logs.
+      api_key: null
+      api_key_env: TEACHER_API_KEY
+
+      # Upper bound on in-flight requests from this client.
+      max_concurrency: 16
+
+      # Total per-request timeout in seconds.
+      timeout_s: 1800.0
+
+      # Retries on transport errors / 5xx, with exponential backoff.
+      max_retries: 3
+      retry_backoff_s: 5.0
     inference:
       _target_: verl.workers.config.RolloutConfig
       name: ${oc.select:actor_rollout_ref.rollout.name}

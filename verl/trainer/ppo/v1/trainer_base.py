@@ -87,7 +87,7 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
-from verl.workers.config import CriticConfig, DistillationConfig
+from verl.workers.config import CriticConfig, DistillationConfig, all_teachers_external
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 from verl.workers.utils.losses import value_loss
@@ -274,7 +274,13 @@ class PPOTrainer(ABC):
 
         # 8. initialize teacher loop manager
         if self.use_teacher_policy:
-            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            # An all-external teacher setup leaves Role.TeacherModel unmapped: there is no
+            # pool to hand over, and get_resource_pool would KeyError on the missing role.
+            teacher_resource_pool = (
+                self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+                if Role.TeacherModel in self.resource_pool_manager.mapping
+                else None
+            )
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
@@ -727,7 +733,9 @@ class PPOTrainer(ABC):
             self.mapping[Role.RewardModel] = "global_pool"
 
         distillation_config = config.get("distillation")
-        if is_distillation_enabled(distillation_config):
+        if is_distillation_enabled(distillation_config) and not all_teachers_external(distillation_config):
+            # Teachers served outside the Ray cluster claim no GPU here, so no pool is
+            # requested and Role.TeacherModel stays unmapped.
             if distillation_config.n_gpus_per_node <= 0:
                 raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
             if distillation_config.nnodes <= 0:

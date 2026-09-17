@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+from typing import Optional
 
 from omegaconf import DictConfig
 
@@ -24,6 +25,8 @@ from verl.utils.ray_utils import auto_await
 from verl.workers.config import DistillationConfig, DistillationTeacherModelConfig, HFModelConfig
 from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.replica import get_rollout_replica_class
+
+from .external_teacher_client import ExternalTeacherClient
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -41,7 +44,7 @@ class TeacherModelManager:
         self,
         distillation_config: DistillationConfig,
         teacher_model_config: DistillationTeacherModelConfig,
-        resource_pool: RayResourcePool,
+        resource_pool: Optional[RayResourcePool],
     ):
         """
         Initialize the teacher model manager.
@@ -49,13 +52,22 @@ class TeacherModelManager:
         Args:
             distillation_config (DistillationConfig): Distillation configuration.
             teacher_model_config (DistillationTeacherModelConfig): Teacher model configuration.
-            resource_pool (RayResourcePool): Dedicated teacher resource pool.
+            resource_pool (RayResourcePool, optional): Dedicated teacher resource pool.
+                ``None`` for an external teacher, which occupies no GPU here.
         """
 
         # Need dataclass conversion for max_logprobs handling in post_init
         self.distillation_config = distillation_config
         self.teacher_model_config = teacher_model_config
         self.resource_pool = resource_pool
+        if teacher_model_config.is_external:
+            # Served outside the Ray cluster: nothing to launch, nothing to balance.
+            # The service does its own scheduling; the client bounds concurrency.
+            self.rollout_replicas = []
+            self.server_handles = []
+            self.server_addresses = []
+            self.load_balancer_handle = None
+            return
         self._initialize_llm_servers()
         self._initialize_load_balancer_handle()
 
@@ -157,14 +169,16 @@ class MultiTeacherModelManager:
     def __init__(
         self,
         config: DictConfig,
-        resource_pool: RayResourcePool,
+        resource_pool: Optional[RayResourcePool],
     ):
         """
         Initialize the multi-teacher model manager.
 
         Args:
             config (DictConfig): Full configuration.
-            resource_pool (RayResourcePool): Combined resource pool for all teachers.
+            resource_pool (RayResourcePool, optional): Combined resource pool for all
+                teachers that run inside the Ray cluster. ``None`` when every teacher
+                is external.
         """
         self.config = config
         self.distillation_config: DistillationConfig = omega_conf_to_dataclass(config.distillation)
@@ -179,14 +193,21 @@ class MultiTeacherModelManager:
 
     def _initialize_teacher_model_managers(self):
         teacher_models = self.distillation_config.teacher_models
-        split_sizes = [teacher.world_size for teacher in teacher_models.values()]
-        split_pools = split_resource_pool(self.resource_pool, split_size=split_sizes)
+        # External teachers claim no GPU, so they are not part of the split. The pool
+        # itself is absent when every teacher is external.
+        local_keys = [key for key, teacher in teacher_models.items() if not teacher.is_external]
+        if local_keys:
+            split_sizes = [teacher_models[key].world_size for key in local_keys]
+            split_pools = split_resource_pool(self.resource_pool, split_size=split_sizes)
+            teacher_pools = dict(zip(local_keys, split_pools, strict=True))
+        else:
+            teacher_pools = {}
 
-        for (key, teacher_model_config), teacher_pool in zip(teacher_models.items(), split_pools, strict=True):
+        for key, teacher_model_config in teacher_models.items():
             manager = TeacherModelManager(
                 distillation_config=self.distillation_config,
                 teacher_model_config=teacher_model_config,
-                resource_pool=teacher_pool,
+                resource_pool=teacher_pools.get(key),
             )
             self.teacher_model_managers[key] = manager
             self.server_addresses[key] = manager.server_addresses
@@ -194,11 +215,19 @@ class MultiTeacherModelManager:
             self.load_balancer_handle[key] = manager.load_balancer_handle
 
     def get_client(self) -> dict[str, LLMServerClient]:
-        """Get the LLMServerClient for each teacher model."""
+        """Get the client for each teacher model.
+
+        External teachers get an HTTP client instead of a Ray-handle one; both expose
+        the same ``generate`` signature.
+        """
         teacher_clients = {}
         for key, manager in self.teacher_model_managers.items():
-            teacher_clients[key] = LLMServerClient(
-                config=self.config,
-                load_balancer_handle=manager.load_balancer_handle,
-            )
+            teacher_model_config = manager.teacher_model_config
+            if teacher_model_config.is_external:
+                teacher_clients[key] = ExternalTeacherClient(config=teacher_model_config.external)
+            else:
+                teacher_clients[key] = LLMServerClient(
+                    config=self.config,
+                    load_balancer_handle=manager.load_balancer_handle,
+                )
         return teacher_clients

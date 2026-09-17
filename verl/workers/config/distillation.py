@@ -22,10 +22,40 @@ from verl.utils.config import omega_conf_to_dataclass
 
 from .rollout import RolloutConfig
 
-__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
+__all__ = [
+    "all_teachers_external",
+    "DistillationLossConfig",
+    "DistillationExternalTeacherConfig",
+    "DistillationTeacherModelConfig",
+    "DistillationConfig",
+]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _external_base_url(teacher_config) -> Optional[str]:
+    """Read ``external.base_url`` from either a DictConfig or a dataclass teacher config."""
+    external = teacher_config.get("external") if hasattr(teacher_config, "get") else teacher_config.external
+    if external is None:
+        return None
+    base_url = external.get("base_url") if hasattr(external, "get") else external.base_url
+    return base_url or None
+
+
+def all_teachers_external(distillation_config) -> bool:
+    """Whether every configured teacher is served outside the Ray cluster.
+
+    Callable on the raw (unconverted) ``distillation`` DictConfig so the trainer can
+    decide whether to request a teacher resource pool at all. Mirrors the
+    ``teacher_model`` popping rule of ``DistillationConfig._resolve_teacher_models``.
+    """
+    teacher_models = dict(distillation_config.get("teacher_models") or {})
+    if len(teacher_models) > 1:
+        teacher_models.pop("teacher_model", None)
+    if not teacher_models:
+        return False
+    return all(_external_base_url(teacher) for teacher in teacher_models.values())
 
 
 @dataclass
@@ -125,6 +155,63 @@ class DistillationLossConfig(BaseConfig):
 
 
 @dataclass
+class DistillationExternalTeacherConfig(BaseConfig):
+    """Configuration for a teacher served outside the verl Ray cluster.
+
+    When ``base_url`` is set, verl launches **no** teacher engine and requests
+    ``prompt_logprobs`` over the OpenAI-compatible ``/v1/completions`` endpoint.
+    The teacher then costs zero GPUs in the training job and its inference stack
+    (engine version, image) is decoupled from the student rollout's.
+
+    The external teacher must share the student's tokenizer: k1 feeds the
+    student's ``sequence_ids`` to the teacher verbatim.
+
+    base_url (str, optional):
+        Base URL of the service, e.g. ``https://xxx.inference.example.com``.
+        ``/v1/completions`` is appended. Setting this enables the external path.
+    model_name (str, optional):
+        Value sent as the request's ``model`` field; must match the server's
+        ``--served-model-name``.
+    api_key (str, optional):
+        Bearer token. Prefer ``api_key_env`` so the secret stays out of configs
+        and logs.
+    api_key_env (str):
+        Environment variable to read the bearer token from when ``api_key`` is
+        unset.
+    max_concurrency (int):
+        Upper bound on in-flight requests from this client. The server queues
+        beyond its KV capacity anyway; this bounds per-request latency so
+        ``timeout_s`` stays meaningful.
+    timeout_s (float):
+        Total per-request timeout. Long trajectories at high concurrency take
+        minutes, so this is much larger than a typical HTTP default.
+    max_retries (int):
+        Retries per request on transport errors or 5xx responses.
+    retry_backoff_s (float):
+        Base delay for exponential backoff between retries.
+    """
+
+    base_url: Optional[str] = None
+    model_name: Optional[str] = None
+    api_key: Optional[str] = None
+    api_key_env: str = "TEACHER_API_KEY"
+    max_concurrency: int = 16
+    timeout_s: float = 1800.0
+    max_retries: int = 3
+    retry_backoff_s: float = 5.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base_url)
+
+    def resolve_api_key(self) -> Optional[str]:
+        """Return the bearer token, preferring the explicit value over the env var."""
+        if self.api_key:
+            return self.api_key
+        return os.environ.get(self.api_key_env) or None
+
+
+@dataclass
 class DistillationTeacherModelConfig(BaseConfig):
     """Configuration for on-policy distillation teacher.
 
@@ -140,6 +227,10 @@ class DistillationTeacherModelConfig(BaseConfig):
         inference.tensor_model_parallel_size * inference.pipeline_model_parallel_size),
         so the teacher's total GPU footprint is
         `num_replicas * per_replica_world_size`.
+    external (DistillationExternalTeacherConfig):
+        Optional external teacher service. When `external.base_url` is set, this
+        teacher occupies no GPU and `inference` / `model_path` / `num_replicas`
+        are unused.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {"num_replicas", "key"}
@@ -148,6 +239,11 @@ class DistillationTeacherModelConfig(BaseConfig):
     model_path: Optional[str] = None
     inference: RolloutConfig = field(default_factory=RolloutConfig)
     num_replicas: Optional[int] = 0
+    external: DistillationExternalTeacherConfig = field(default_factory=DistillationExternalTeacherConfig)
+
+    @property
+    def is_external(self) -> bool:
+        return self.external.enabled
 
     @property
     def per_replica_world_size(self) -> int:
@@ -159,17 +255,32 @@ class DistillationTeacherModelConfig(BaseConfig):
 
     @property
     def world_size(self) -> int:
+        # An external teacher runs outside the Ray cluster and claims no GPU here.
+        if self.is_external:
+            return 0
         return self.num_replicas * self.per_replica_world_size
 
     def check_configured(self):
-        if self.model_path is None:
-            raise ValueError("model_path must be specified for distillation teacher model config.")
         if self.key is None:
             raise ValueError("key must be specified for distillation teacher model config.")
+        if self.is_external:
+            if self.external.model_name is None:
+                raise ValueError(
+                    "external.model_name must be specified for an external distillation teacher; "
+                    "it must match the server's --served-model-name."
+                )
+            return
+        if self.model_path is None:
+            raise ValueError("model_path must be specified for distillation teacher model config.")
         if self.num_replicas is None:
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
 
     def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
+        if self.is_external:
+            # No engine is booted here, so there is no local context window or
+            # max_logprobs cap to align. Length/topk limits are the serving
+            # side's responsibility.
+            return
         # Prompt + Response from student are fed into teacher as context
         max_model_len = self.inference.max_model_len
         student_prompt_length = self.inference.prompt_length
@@ -291,6 +402,18 @@ class DistillationConfig(BaseConfig):
         if len(self.teacher_models) == 1:
             # Single teacher occupies the entire teacher resource pool.
             teacher_model = self.teacher_models["teacher_model"]
+            if _external_base_url(teacher_model):
+                # External teacher: no replicas to lay out, no pool to divide.
+                pool_size = self.n_gpus_per_node * self.nnodes
+                if pool_size != 0:
+                    raise ValueError(
+                        f"External distillation teacher occupies no GPU, but a teacher resource pool of "
+                        f"{pool_size} GPUs was requested ({self.n_gpus_per_node=} * {self.nnodes=}). "
+                        f"Set distillation.nnodes=0."
+                    )
+                teacher_model.num_replicas = 0
+                teacher_model.key = "default"
+                return self._to_keyed_teacher_models()
             inference = teacher_model.inference
             per_replica = (
                 inference.tensor_model_parallel_size
@@ -309,6 +432,9 @@ class DistillationConfig(BaseConfig):
             # Multiple teachers: remove default single teacher config
             self.teacher_models.pop("teacher_model")
 
+        return self._to_keyed_teacher_models()
+
+    def _to_keyed_teacher_models(self) -> dict[str, DistillationTeacherModelConfig]:
         # Teacher models dict is keyed by teacher_key instead of YAML entry name
         teacher_models = {}
         for teacher_config in self.teacher_models.values():
